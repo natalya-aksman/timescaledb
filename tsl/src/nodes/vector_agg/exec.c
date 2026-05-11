@@ -207,7 +207,7 @@ columnar_result_set_row(ColumnarResult *columnar_result, DecompressBatchState co
 #endif
 			memcpy(row * columnar_result->type + (uint8 *restrict) columnar_result->body_buffer,
 				   &datum,
-				   sizeof(Datum));
+				   columnar_result->type);
 			break;
 #ifndef USE_FLOAT8_BYVAL
 		case 8:
