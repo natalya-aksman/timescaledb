@@ -577,7 +577,7 @@ gapfill_build_pathtarget(PathTarget *pt_upper, PathTarget *pt_path, PathTarget *
 	}
 }
 
-static int
+static double
 estimate_gapfill_groups(PlannerInfo *root, int path_rows)
 {
 #if PG16_GE
@@ -601,7 +601,7 @@ estimate_gapfill_groups(PlannerInfo *root, int path_rows)
 			group_exprs_without_gapfill = lappend(group_exprs_without_gapfill, group_expr);
 		}
 	}
-	int num_groups = 1;
+	double num_groups = 1.0;
 	if (group_exprs_without_gapfill != NULL)
 	{
 		num_groups = estimate_num_groups(root, group_exprs_without_gapfill, path_rows, NULL, NULL);
@@ -633,7 +633,7 @@ gapfill_path_create(PlannerInfo *root, Path *subpath, FuncExpr *func)
 
 	/* If we can estimate gapfills, we should estimate number of non-gapfill groups
 	 * as gapfills will be repeated for each group. */
-	int num_groups = 1;
+	double num_groups = 1.0;
 	if (gapfill_rows > 0)
 	{
 		num_groups = estimate_gapfill_groups(root, subpath->rows);
