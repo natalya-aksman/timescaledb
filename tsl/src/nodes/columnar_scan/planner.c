@@ -1296,7 +1296,7 @@ columnar_scan_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 				   "pathkey");
 		}
 
-		sort_options = list_make4(sort_col_idx, sort_ops, sort_collations, sort_nulls);
+			sort_options = list_make5(sort_col_idx, sort_ops, sort_collations, sort_nulls, list_length(dcpath->required_compressed_pathkeys));
 
 		/*
 		 * Build a sort node for the compressed batches. The sort function is

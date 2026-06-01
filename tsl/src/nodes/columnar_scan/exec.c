@@ -387,7 +387,7 @@ columnar_scan_begin(CustomScanState *node, EState *estate, int eflags)
 	{
 		chunk_state->batch_queue =
 			batch_queue_heap_create(num_data_columns,
-									chunk_state->sortinfo,
+									chunk_state->sortinfo, 
 									dcontext->custom_scan_slot->tts_tupleDescriptor,
 									&BatchQueueFunctionsHeap);
 		chunk_state->exec_methods.ExecCustomScan = columnar_scan_exec_heap;
@@ -455,7 +455,6 @@ columnar_scan_exec_impl(ColumnarScanState *chunk_state, const BatchQueueFunction
 		TupleTableSlot *subslot = ExecProcNode(linitial(chunk_state->csstate.custom_ps));
 		if (TupIsNull(subslot))
 		{
-			/* Won't have more compressed tuples. */
 			break;
 		}
 
