@@ -122,16 +122,16 @@ tsl_recompress_chunk_segmentwise(PG_FUNCTION_ARGS)
 							"compression with no "
 							"order by")));
 		}
-		bool nullable_orderby = !is_chunk_orderby_nonnullable(settings);
-		if (nullable_orderby)
+		bool orderby_not_handling_nulls = !is_chunk_orderby_nullhandling(settings);
+		if (orderby_not_handling_nulls)
 		{
 			elog(ts_guc_debug_compression_path_info ? INFO : DEBUG1,
-				 "in-memory recompression is disabled due to nullable order by, "
+				 "in-memory recompression is disabled due to nullable order by with no firstlast, "
 				 "performing segmentwise decompress/compress on chunk \"%s.%s\"",
 				 NameStr(chunk->fd.schema_name),
 				 NameStr(chunk->fd.table_name));
 		}
-		recompress_chunk_segmentwise_impl(chunk, nullable_orderby);
+		recompress_chunk_segmentwise_impl(chunk, orderby_not_handling_nulls);
 	}
 
 	PG_RETURN_OID(uncompressed_relid);
@@ -1065,13 +1065,31 @@ update_orderby_scankeys(Datum *values, bool *isnulls, int num_segmentby, int num
 }
 
 static enum Batch_match_result
-handle_null_scan(int key_flags, bool nulls_first, enum Batch_match_result result)
+handle_null_scan(TupleTableSlot *compressed_slot, ScanKey key, bool nulls_first, bool min_bound,
+				 enum Batch_match_result result)
 {
-	if (key_flags & SK_ISNULL)
+	/* uncompressed tuple key is NULL */
+	if (key->sk_flags & SK_ISNULL)
 	{
 		return nulls_first ? Tuple_before : Tuple_after;
 	}
 
+	bool is_null;
+	slot_getattr(compressed_slot, key->sk_attno, &is_null);
+	/* compressed boundary is NULL */
+	if (is_null)
+	{
+		if (min_bound)
+		{
+			/*  1 in [NULL, 10], 1 before [NULL, NULL] */
+			return nulls_first ? Tuple_match : Tuple_before;
+		}
+		else
+		{
+			/*  10 after [NULL, NULL], 10 in [1, NULL] */
+			return nulls_first ? Tuple_after : Tuple_match;
+		}
+	}
 	return result;
 }
 
@@ -1079,6 +1097,7 @@ static enum Batch_match_result
 match_tuple_batch(TupleTableSlot *compressed_slot, int num_orderby, ScanKey orderby_scankeys,
 				  bool *nulls_first)
 {
+	enum Batch_match_result result = Tuple_match;
 	/*
 	 * Only the leading orderby column gives a sound before/after verdict from
 	 * batch metadata. The min/max for later orderby columns are aggregated
@@ -1092,17 +1111,30 @@ match_tuple_batch(TupleTableSlot *compressed_slot, int num_orderby, ScanKey orde
 		ScanKey key = &orderby_scankeys[0];
 		if (!slot_key_test(compressed_slot, key))
 		{
-			return handle_null_scan(key->sk_flags, nulls_first[0], Tuple_before);
+			result = handle_null_scan(compressed_slot,
+									  key,
+									  nulls_first[0],
+									  /* min_bound = */ true,
+									  Tuple_before);
+			/* for x in [NULL, 10] scenario keep matching x to 10 */
+			if (result != Tuple_match)
+			{
+				return result;
+			}
 		}
 
 		key = &orderby_scankeys[1];
 		if (!slot_key_test(compressed_slot, key))
 		{
-			return handle_null_scan(key->sk_flags, nulls_first[0], Tuple_after);
+			result = handle_null_scan(compressed_slot,
+									  key,
+									  nulls_first[0],
+									  /* min_bound = */ false,
+									  Tuple_after);
 		}
 	}
 
-	return Tuple_match;
+	return result;
 }
 
 static bool

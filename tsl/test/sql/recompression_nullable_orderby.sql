@@ -2,9 +2,11 @@
 -- Please see the included NOTICE for copyright information and
 -- LICENSE-TIMESCALE for a copy of the license.
 
+\c :TEST_DBNAME :ROLE_SUPERUSER
+
 -- #9444: do not recompress when order by columns are nullable, do decompress/compress instead.
 -- It is due to compression min/max metadata not handling NULLs.
--- When we implement chunks with min/max NULL-handling metadata, this restriction can be lifted.
+-- For chunks with min/max NULL-handling metadata (i.e. with first/last metadata), this restriction can be lifted.
 
 SET timescaledb.enable_direct_compress_insert TO OFF;
 SET timescaledb.batch_sorted_merge = 'off';
@@ -18,6 +20,26 @@ ALTER TABLE t1 SET (timescaledb.compress, timescaledb.compress_segmentby='dev', 
 INSERT INTO t1 SELECT 1, 1, g FROM generate_series(1,800) g;
 INSERT INTO t1 SELECT 1, 1, NULL FROM generate_series(1,200);
 SELECT compress_chunk(show_chunks('t1'));
+
+-- Remove firstlast index from order by columns
+update _timescaledb_catalog.compression_settings
+set index = '[{"type": "minmax", "column": "v1", "source": "orderby"}, {"type": "minmax", "column": "time", "source": "orderby"}]'
+where relid = 't1'::regclass;
+
+update _timescaledb_catalog.compression_settings
+set index = '[{"type": "minmax", "column": "v1", "source": "orderby"}, {"type": "minmax", "column": "time", "source": "orderby"}]'
+where compress_relid = (select format('%I.%I', schema_name, table_name)::regclass AS chunk_regclass from _timescaledb_catalog.chunk
+    where id = (select compressed_chunk_id  from _timescaledb_catalog.chunk
+        where hypertable_id = (select id from _timescaledb_catalog.hypertable
+            where table_name = 't1') limit 1));
+
+-- Use minmax index on (v1, time DESC) instead
+select schema_name || '.' || table_name comp_chunk  from _timescaledb_catalog.chunk
+    where id = (select compressed_chunk_id from _timescaledb_catalog.chunk
+        where hypertable_id = (select id from _timescaledb_catalog.hypertable
+            where table_name = 't1') limit 1)
+\gset
+create index t1_compressed_index_minmax on :comp_chunk (dev, _ts_meta_min_1, _ts_meta_max_1, _ts_meta_min_2 DESC, _ts_meta_max_2 DESC);
 
 -- Now this chunk is partial
 INSERT INTO t1 SELECT 1, 1, g FROM generate_series(901,1400) g;
@@ -53,7 +75,7 @@ SELECT show_chunks as chunk_to_recompress FROM show_chunks('t1') LIMIT 1 \gset
 SELECT _timescaledb_functions.recompress_chunk_segmentwise(:'chunk_to_recompress');
 RESET client_min_messages;
 
--- If only some of order by columns are nullable we still bail out on recompress
+-- If only some of order by columns are nullable without firstlast, we still bail out on recompress
 CREATE TABLE t2(time int NOT NULL, v1 int NOT NULL, v2 int);
 SELECT create_hypertable('t2', 'time', chunk_time_interval => 10000);
 ALTER TABLE t2 SET (timescaledb.compress, timescaledb.compress_orderby='v1,v2');
@@ -61,6 +83,26 @@ ALTER TABLE t2 SET (timescaledb.compress, timescaledb.compress_orderby='v1,v2');
 INSERT INTO t2 SELECT 1, 1, g FROM generate_series(1,800) g;
 INSERT INTO t2 SELECT 1, 1, NULL FROM generate_series(1,200);
 SELECT compress_chunk(show_chunks('t2'));
+
+-- Remove firstlast index from nullable order by column "v2"
+update _timescaledb_catalog.compression_settings
+set index = '[{"type": "minmax", "column": "v1", "source": "orderby"}, {"type": "firstlast", "column": "v1", "source": "orderby"}, {"type": "minmax", "column": "v2", "source": "orderby"}, {"type": "minmax", "column": "time", "source": "orderby"}, {"type": "firstlast", "column": "time", "source": "orderby"}]'
+where relid = 't2'::regclass;
+
+update _timescaledb_catalog.compression_settings
+set index = '[{"type": "minmax", "column": "v1", "source": "orderby"}, {"type": "firstlast", "column": "v1", "source": "orderby"}, {"type": "minmax", "column": "v2", "source": "orderby"}, {"type": "minmax", "column": "time", "source": "orderby"}, {"type": "firstlast", "column": "time", "source": "orderby"}]'
+where compress_relid = (select format('%I.%I', schema_name, table_name)::regclass AS chunk_regclass from _timescaledb_catalog.chunk
+    where id = (select compressed_chunk_id  from _timescaledb_catalog.chunk
+        where hypertable_id = (select id from _timescaledb_catalog.hypertable
+            where table_name = 't2') limit 1));
+
+-- Use minmax index on (v1, v2, time DESC) instead
+select schema_name || '.' || table_name comp_chunk  from _timescaledb_catalog.chunk
+    where id = (select compressed_chunk_id from _timescaledb_catalog.chunk
+        where hypertable_id = (select id from _timescaledb_catalog.hypertable
+            where table_name = 't2') limit 1)
+\gset
+create index t2_compressed_index_minmax on :comp_chunk (_ts_meta_min_1, _ts_meta_max_1, _ts_meta_min_2, _ts_meta_max_2, _ts_meta_min_3 DESC, _ts_meta_max_3 DESC);
 
 -- Now this chunk is partial
 INSERT INTO t2 SELECT 1, 1, g FROM generate_series(901,1400) g;
