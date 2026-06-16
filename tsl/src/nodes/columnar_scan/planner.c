@@ -1189,7 +1189,9 @@ columnar_scan_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 		 * we must match the pathkeys to the decompressed chunk tupdesc.
 		 */
 
-		int numsortkeys = list_length(dcpath->custom_path.path.pathkeys);
+		int numkeys = list_length(dcpath->custom_path.path.pathkeys);
+		int numsegkeys = list_length(dcpath->required_compressed_pathkeys);
+		int numsortkeys = numkeys - numsegkeys;
 
 		List *sort_col_idx = NIL;
 		List *sort_ops = NIL;
@@ -1224,79 +1226,78 @@ columnar_scan_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 				/* Setting up so that the check below doesn't complain */
 				membercell = &list_make_int_cell(1);
 #else
-			foreach (membercell, ec->ec_members)
-			{
-				em = lfirst(membercell);
+				foreach (membercell, ec->ec_members)
+				{
+					em = lfirst(membercell);
 #endif
+					
+					if (em->em_is_const)
+					{
+						continue;
+					}
+					
+					int em_relid;
+					if (!bms_get_singleton_member(em->em_relids, &em_relid))
+					{
+						continue;
+					}
 
-				if (em->em_is_const)
-				{
-					continue;
+					if ((Index) em_relid != dcpath->info->chunk_rel->relid)
+					{
+						continue;
+					}
+
+					/*
+					 * The equivalence member expression might be a monotonous
+					 * expression of the decompressed relation Var, so recurse to
+					 * find it.
+					 */
+					Var *var = find_var_subexpression(em->em_expr, em_relid);
+					Ensure(var != NULL,
+						   "non-Var pathkey not expected for compressed batch sorted merge");
+
+					Assert((Index) var->varno == (Index) em_relid);
+
+					/*
+					 * Convert its varattno which is the varattno of the
+					 * uncompressed chunk tuple, to the decompressed scan tuple
+					 * varattno.
+					 */
+					const int decompressed_scan_attno =
+						context.uncompressed_attno_info[var->varattno].custom_scan_attno;
+					Assert(decompressed_scan_attno > 0);
+					
+					/*
+					 * Look up the correct sort operator from the PathKey's slightly
+					 * abstracted representation.
+					 */
+					Oid sortop = get_opfamily_member(pk->pk_opfamily,
+													 var->vartype,
+													 var->vartype,
+													 pk->pk_cmptype);
+					if (!OidIsValid(sortop)) /* should not happen */
+					{
+						elog(ERROR,
+							 "missing operator %d(%u,%u) in opfamily %u",
+							 pk->pk_cmptype,
+							 var->vartype,
+							 var->vartype,
+							 pk->pk_opfamily);
+					}
+
+					sort_col_idx = lappend_oid(sort_col_idx, decompressed_scan_attno);
+					sort_collations = lappend_oid(sort_collations, var->varcollid);
+					sort_nulls = lappend_oid(sort_nulls, pk->pk_nulls_first);
+					sort_ops = lappend_oid(sort_ops, sortop);
+					
+					break;
 				}
-
-				int em_relid;
-				if (!bms_get_singleton_member(em->em_relids, &em_relid))
-				{
-					continue;
-				}
-
-				if ((Index) em_relid != dcpath->info->chunk_rel->relid)
-				{
-					continue;
-				}
-
-				/*
-				 * The equivalence member expression might be a monotonous
-				 * expression of the decompressed relation Var, so recurse to
-				 * find it.
-				 */
-				Var *var = find_var_subexpression(em->em_expr, em_relid);
-				Ensure(var != NULL,
-					   "non-Var pathkey not expected for compressed batch sorted merge");
-
-				Assert((Index) var->varno == (Index) em_relid);
-
-				/*
-				 * Convert its varattno which is the varattno of the
-				 * uncompressed chunk tuple, to the decompressed scan tuple
-				 * varattno.
-				 */
-				const int decompressed_scan_attno =
-					context.uncompressed_attno_info[var->varattno].custom_scan_attno;
-				Assert(decompressed_scan_attno > 0);
-
-				/*
-				 * Look up the correct sort operator from the PathKey's slightly
-				 * abstracted representation.
-				 */
-				Oid sortop = get_opfamily_member(pk->pk_opfamily,
-												 var->vartype,
-												 var->vartype,
-												 pk->pk_cmptype);
-				if (!OidIsValid(sortop)) /* should not happen */
-				{
-					elog(ERROR,
-						 "missing operator %d(%u,%u) in opfamily %u",
-						 pk->pk_cmptype,
-						 var->vartype,
-						 var->vartype,
-						 pk->pk_opfamily);
-				}
-
-				sort_col_idx = lappend_oid(sort_col_idx, decompressed_scan_attno);
-				sort_collations = lappend_oid(sort_collations, var->varcollid);
-				sort_nulls = lappend_oid(sort_nulls, pk->pk_nulls_first);
-				sort_ops = lappend_oid(sort_ops, sortop);
-
-				break;
+				Ensure(membercell != NULL,
+					   "could not find matching decompressed chunk column for batch sorted merge "
+					   "pathkey");
 			}
-
-			Ensure(membercell != NULL,
-				   "could not find matching decompressed chunk column for batch sorted merge "
-				   "pathkey");
-		}
-
-			sort_options = list_make5(sort_col_idx, sort_ops, sort_collations, sort_nulls, list_length(dcpath->required_compressed_pathkeys));
+			List *sort_numsegkeys = list_make1_int(numsegkeys);
+			sort_options = list_make5(sort_col_idx, sort_ops, sort_collations, sort_nulls, sort_numsegkeys);
 
 		/*
 		 * Build a sort node for the compressed batches. The sort function is
@@ -1311,12 +1312,12 @@ columnar_scan_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 		bool *nullsFirst = palloc(sizeof(bool) * numsortkeys);
 		for (int i = 0; i < numsortkeys; i++)
 		{
-			Oid sortop = list_nth_oid(sort_ops, i);
+			Oid sortop = list_nth_oid(sort_ops, i + numsegkeys);
 
 			/* Find the operator in pg_amop --- failure shouldn't happen */
 			Oid opfamily, opcintype;
 			CompareType strategy;
-			if (!get_ordering_op_properties(list_nth_oid(sort_ops, i),
+			if (!get_ordering_op_properties(list_nth_oid(sort_ops, i + numsegkeys),
 											&opfamily,
 											&opcintype,
 											&strategy))
@@ -1334,10 +1335,9 @@ columnar_scan_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 			char *upper_name;
 			orderby_sparse_metadata_names(dcpath->info->settings, i + 1, &lower_name, &upper_name);
 			char *meta_col_name = strategy == BTLessStrategyNumber ? lower_name : upper_name;
-
+			
 			AttrNumber attr_position =
 				get_attnum(dcpath->info->compressed_rte->relid, meta_col_name);
-
 			if (attr_position == InvalidAttrNumber)
 			{
 				elog(ERROR, "couldn't find metadata column \"%s\"", meta_col_name);
@@ -1359,8 +1359,8 @@ columnar_scan_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 			}
 
 			sortOperators[i] = sortop;
-			collations[i] = list_nth_oid(sort_collations, i);
-			nullsFirst[i] = list_nth_oid(sort_nulls, i);
+			collations[i] = list_nth_oid(sort_collations, i + numsegkeys);
+			nullsFirst[i] = list_nth_oid(sort_nulls, i + numsegkeys);
 		}
 
 		/* Now build the compressed batches sort node */

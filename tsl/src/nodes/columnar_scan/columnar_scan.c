@@ -1525,7 +1525,7 @@ build_on_single_compressed_path(PlannerInfo *root, const Chunk *chunk, RelOptInf
 	 * will determine whether to put an actual sort between the decompression
 	 * node and the scan during plan creation.
 	 */
-	if (sort_info->use_compressed_sort)
+	if (sort_info->use_compressed_sort && !sort_info->use_batch_sorted_merge)
 	{
 		ColumnarScanPath *columnar_scan_with_compressed_sort = NULL;
 		Path dummy_sort_path; /* dummy for result of cost_sort */
@@ -3181,17 +3181,10 @@ build_sortinfo(PlannerInfo *root, const Chunk *chunk, RelOptInfo *chunk_rel,
 													  chunk_em_exprs,
 													  /* starting_pathkey_offset = */ i,
 													  compression_info,
-													  /* for_bsm = */ true,
+													  /* for_batch_sorted_merge = */ true,
 													  &sort_info.reverse);
 			if (sort_info.use_batch_sorted_merge && sort_info.num_segmentby_pathkeys)
 			{
-				sort_info.use_batch_sorted_merge =
-					match_pathkeys_to_compression_orderby(pathkeys,
-														  chunk_em_exprs,
-														  /* starting_pathkey_offset = */ i,
-														  compression_info,
-														  /* for_batch_sorted_merge = */ true,
-														  &sort_info.reverse);
 				sort_info.use_compressed_sort = true;
 			}
 			return sort_info;
@@ -3218,17 +3211,10 @@ build_sortinfo(PlannerInfo *root, const Chunk *chunk, RelOptInfo *chunk_rel,
 												  chunk_em_exprs,
 												  /* starting_pathkey_offset = */ sort_info.num_segmentby_pathkeys,
 												  compression_info,
-												  /* for_bsm = */ true,
+												  /* for_batch_sorted_merge = */ true,
 												  &sort_info.reverse);
 		if (sort_info.use_batch_sorted_merge && sort_info.num_segmentby_pathkeys)
 		{
-			sort_info.use_batch_sorted_merge =
-				match_pathkeys_to_compression_orderby(pathkeys,
-													  chunk_em_exprs,
-													  /* starting_pathkey_offset = */ 0,
-													  compression_info,
-													  /* for_batch_sorted_merge = */ true,
-													  &sort_info.reverse);
 			sort_info.use_compressed_sort = true;
 		}
 		return sort_info;
