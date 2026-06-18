@@ -1656,6 +1656,7 @@ struct decompress_chunk_context
 {
 	List *relids;
 	ModifyHypertableState *ht_state;
+	PlanState *parent_state;
 	/* indicates decompression actually occurred */
 	bool batches_decompressed;
 	bool has_joins;
@@ -1672,11 +1673,34 @@ decompress_target_segments(ModifyHypertableState *ht_state)
 	struct decompress_chunk_context ctx = {
 		.ht_state = ht_state,
 		.relids = castNode(ModifyTable, ps->ps.plan)->resultRelations,
+		.parent_state = NULL,
 	};
 	Assert(ctx.relids);
 
 	decompress_chunk_walker(&ps->ps, &ctx);
 	return ctx.batches_decompressed;
+}
+
+/* Predicates on compressed scan can be One-Time Filter on parent ResultState like WHERE EXISTS,
+ * we should check for those predicates as well */
+static void
+add_onetime_filter(PlanState *parent_state, List **predicates)
+{
+	if (parent_state && IsA(parent_state, ResultState))
+	{
+		Node *onetime_filter = ((Result *) parent_state->plan)->resconstantqual;
+		if (onetime_filter)
+		{
+			if (IsA(onetime_filter, List))
+			{
+				*predicates = list_concat_unique(*predicates, (List *) onetime_filter);
+			}
+			else
+			{
+				*predicates = lappend(*predicates, onetime_filter);
+			}
+		}
+	}
 }
 
 static bool
@@ -1705,11 +1729,13 @@ decompress_chunk_walker(PlanState *ps, struct decompress_chunk_context *ctx)
 			 * any filters that are used for filtering heap tuples
 			 */
 			predicates = list_union(((IndexScan *) ps->plan)->indexqualorig, ps->plan->qual);
+			add_onetime_filter(ctx->parent_state, &predicates);
 			needs_decompression = true;
 			break;
 		}
 		case T_BitmapHeapScanState:
 			predicates = list_union(((BitmapHeapScan *) ps->plan)->bitmapqualorig, ps->plan->qual);
+			add_onetime_filter(ctx->parent_state, &predicates);
 			needs_decompression = true;
 			should_rescan = true;
 			break;
@@ -1719,6 +1745,7 @@ decompress_chunk_walker(PlanState *ps, struct decompress_chunk_context *ctx)
 		case T_TidRangeScanState:
 		{
 			predicates = list_copy(ps->plan->qual);
+			add_onetime_filter(ctx->parent_state, &predicates);
 			needs_decompression = true;
 			break;
 		}
@@ -1801,7 +1828,7 @@ decompress_chunk_walker(PlanState *ps, struct decompress_chunk_context *ctx)
 	{
 		pfree(predicates);
 	}
-
+	ctx->parent_state = ps;
 	return planstate_tree_walker(ps, decompress_chunk_walker, ctx);
 }
 
