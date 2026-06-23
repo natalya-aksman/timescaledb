@@ -112,7 +112,7 @@ compare_heap_pos_impl(Datum a, Datum b, void *arg,
 											   entryA[0].null,
 											   entryB[0].value,
 											   entryB[0].null,
-											   &sortkeys[0]);
+											   &sortkeys[queue->nsegkeys]);
 	if (compare != 0)
 	{
 		INVERT_COMPARE_RESULT(compare);
@@ -125,7 +125,7 @@ compare_heap_pos_impl(Datum a, Datum b, void *arg,
 										  entryA[key].null,
 										  entryB[key].value,
 										  entryB[key].null,
-										  &sortkeys[key]);
+										  &sortkeys[key + queue->nsegkeys]);
 
 		if (compare != 0)
 		{
@@ -200,7 +200,7 @@ batch_queue_heap_push_new_segment_batch(BatchQueueHeap *queue)
 	 */
 	for (int key = 0; key < queue->nsortkeys; key++)
 	{
-		SortSupport sortKey = &queue->sortkeys[key];
+		SortSupport sortKey = &queue->sortkeys[key + queue->nsegkeys];
 		const AttrNumber attr = AttrNumberGetAttrOffset(sortKey->ssup_attno);
 		queue->last_batch_first_tuple_entry[key].value =
 			queue->last_batch_first_tuple_slot->tts_values[attr];
@@ -223,7 +223,7 @@ batch_queue_heap_push_new_segment_batch(BatchQueueHeap *queue)
 	 */
 	for (int key = 0; key < queue->nsortkeys; key++)
 	{
-		SortSupport sortKey = &queue->sortkeys[key];
+		SortSupport sortKey = &queue->sortkeys[key + queue->nsegkeys];
 		const AttrNumber attr = AttrNumberGetAttrOffset(sortKey->ssup_attno);
 		/*
 		 * We're working with virtual tuple slots so no need for slot_getattr().
@@ -273,7 +273,7 @@ batch_queue_heap_pop(BatchQueue *bq, DecompressContext *dcontext)
 		 */
 		for (int key = 0; key < queue->nsortkeys; key++)
 		{
-			SortSupport sortKey = &queue->sortkeys[key];
+			SortSupport sortKey = &queue->sortkeys[key + queue->nsegkeys];
 			const AttrNumber attr = AttrNumberGetAttrOffset(sortKey->ssup_attno);
 			/*
 			 * We're working with virtual tuple slots so no need for slot_getattr().
@@ -316,7 +316,7 @@ batch_queue_heap_needs_next_batch(BatchQueue *_queue)
 		compare_entries(&queue->heap_entries[queue->nsortkeys * top_batch_index],
 						queue->last_batch_first_tuple_entry,
 						queue->sortkeys,
-						queue->nsortkeys, /* offset = */0);
+						queue->nsortkeys, /* offset = */queue->nsegkeys);
 
 	/*
 	 * The invariant we have to preserve is that either:
@@ -367,7 +367,7 @@ batch_queue_heap_push_batch(BatchQueue *_queue, DecompressContext *dcontext,
 		{			
 			for (int key = 0; key < queue->nsegkeys; key++)
 			{
-				SortSupport sortKey = &queue->sortkeys[key + queue->nsortkeys];
+				SortSupport sortKey = &queue->sortkeys[key];
 				const AttrNumber attr = AttrNumberGetAttrOffset(sortKey->ssup_attno);
 				queue->current_segmentby_entry[key].value =
 					queue->last_batch_first_tuple_slot->tts_values[attr];
@@ -380,7 +380,7 @@ batch_queue_heap_push_batch(BatchQueue *_queue, DecompressContext *dcontext,
 		{			
 			for (int key = 0; key < queue->nsegkeys; key++)
 			{
-				SortSupport sortKey = &queue->sortkeys[key + queue->nsortkeys];
+				SortSupport sortKey = &queue->sortkeys[key];
 				const AttrNumber attr = AttrNumberGetAttrOffset(sortKey->ssup_attno);
 				queue->new_segmentby_entry[key].value =
 					queue->last_batch_first_tuple_slot->tts_values[attr];
@@ -391,7 +391,7 @@ batch_queue_heap_push_batch(BatchQueue *_queue, DecompressContext *dcontext,
 				compare_entries(queue->current_segmentby_entry,
 								queue->new_segmentby_entry,
 								queue->sortkeys,
-								queue->nsegkeys, /* offset = */queue->nsortkeys);
+								queue->nsegkeys, /* offset = */0);
 			if (comparison_result != 0)
 			{
 				queue->new_segment_batch_index = new_batch_index;
@@ -409,7 +409,7 @@ batch_queue_heap_push_batch(BatchQueue *_queue, DecompressContext *dcontext,
 	 */
 	for (int key = 0; key < queue->nsortkeys; key++)
 	{
-		SortSupport sortKey = &queue->sortkeys[key];
+		SortSupport sortKey = &queue->sortkeys[key + queue->nsegkeys];
 		const AttrNumber attr = AttrNumberGetAttrOffset(sortKey->ssup_attno);
 		queue->last_batch_first_tuple_entry[key].value =
 			queue->last_batch_first_tuple_slot->tts_values[attr];
@@ -431,7 +431,7 @@ batch_queue_heap_push_batch(BatchQueue *_queue, DecompressContext *dcontext,
 	 */
 	for (int key = 0; key < queue->nsortkeys; key++)
 	{
-		SortSupport sortKey = &queue->sortkeys[key];
+		SortSupport sortKey = &queue->sortkeys[key + queue->nsegkeys];
 		const AttrNumber attr = AttrNumberGetAttrOffset(sortKey->ssup_attno);
 		/*
 		 * We're working with virtual tuple slots so no need for slot_getattr().
@@ -531,9 +531,10 @@ build_batch_sorted_merge_info(const List *sortinfo, int *nsegkeys, int *nsortkey
 	List *sort_ops = lsecond(sortinfo);
 	List *sort_collations = lthird(sortinfo);
 	List *sort_nulls = lfourth(sortinfo);
+	List *sort_nsegkeys = lfirst(list_nth_cell(sortinfo, 4)); /* lfifth */
 
 	int nkeys = list_length(linitial((sortinfo)));
-	*nsegkeys = lfirst_int(list_nth_cell(sortinfo, 5));
+	*nsegkeys = linitial_int(sort_nsegkeys);
 	*nsortkeys = nkeys - *nsegkeys;
 
 	Assert(list_length(sort_col_idx) == list_length(sort_ops));
@@ -547,11 +548,10 @@ build_batch_sorted_merge_info(const List *sortinfo, int *nsegkeys, int *nsortkey
 	for (int i = 0; i < nkeys; i++)
 	{
 		SortSupportData *sortkey = &sortkeys[i];
-		int offset = (i < *nsortkeys ? *nsegkeys : 0);
 		sortkey->ssup_cxt = CurrentMemoryContext;
-		sortkey->ssup_collation = list_nth_oid(sort_collations, i + offset);
-		sortkey->ssup_nulls_first = list_nth_oid(sort_nulls, i + offset);
-		sortkey->ssup_attno = list_nth_oid(sort_col_idx, i + offset);
+		sortkey->ssup_collation = list_nth_oid(sort_collations, i);
+		sortkey->ssup_nulls_first = list_nth_oid(sort_nulls, i);
+		sortkey->ssup_attno = list_nth_oid(sort_col_idx, i);
 
 		/*
 		 * It isn't feasible to perform abbreviated key conversion, since
@@ -561,7 +561,7 @@ build_batch_sorted_merge_info(const List *sortinfo, int *nsegkeys, int *nsortkey
 		 * additional optimization entirely.
 		 */
 		sortkey->abbreviate = false;
-		PrepareSortSupportFromOrderingOp(list_nth_oid(sort_ops, i + offset), sortkey);
+		PrepareSortSupportFromOrderingOp(list_nth_oid(sort_ops, i), sortkey);
 	}
 	return sortkeys;
 }

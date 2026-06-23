@@ -3173,13 +3173,13 @@ build_sortinfo(PlannerInfo *root, const Chunk *chunk, RelOptInfo *chunk_rel,
 		if (bms_num_members(segmentby_columns) != compression_info->num_segmentby_columns)
 		{
 			/*
-			 * If we didn't have any segmentby columns in pathkeys, try batch sorted merge
+			 * If we didn't have all segmentby columns in pathkeys, try batch sorted merge
 			 * instead.
 			 */
 			sort_info.use_batch_sorted_merge =
 				match_pathkeys_to_compression_orderby(pathkeys,
 													  chunk_em_exprs,
-													  /* starting_pathkey_offset = */ i,
+													  /* starting_pathkey_offset = */ sort_info.num_segmentby_pathkeys,
 													  compression_info,
 													  /* for_batch_sorted_merge = */ true,
 													  &sort_info.reverse);
