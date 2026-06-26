@@ -26,8 +26,8 @@ typedef struct BatchQueueHeap
 	/*
 	 * Requested sort order of the heap.
 	 */
-	int nsegkeys;    /* segmentby keys only */
-	int nsortkeys;   /* heap sort keys only */
+	int nsegkeys;  /* segmentby keys only */
+	int nsortkeys; /* heap sort keys only */
 	SortSupport sortkeys;
 
 	/*
@@ -70,10 +70,10 @@ compare_entries(HeapEntryColumn *entryA, HeapEntryColumn *entryB, const SortSupp
 {
 	for (int key = 0; key < nsortkeys; key++)
 	{
-		int compare = ApplySortComparator(entryA[key + offset].value,
-										  entryA[key + offset].null,
-										  entryB[key + offset].value,
-										  entryB[key + offset].null,
+		int compare = ApplySortComparator(entryA[key].value,
+										  entryA[key].null,
+										  entryB[key].value,
+										  entryB[key].null,
 										  &sortkeys[key + offset]);
 
 		if (compare != 0)
@@ -101,6 +101,17 @@ compare_heap_pos_impl(Datum a, Datum b, void *arg,
 
 	int batchB = DatumGetInt32(b);
 	Assert(batchB <= batch_array->n_batch_states);
+
+	/* B > A always */
+	if (batchB == queue->new_segment_batch_index)
+	{
+		return 1;
+	}
+	/* A > B always */
+	else if (batchA == queue->new_segment_batch_index)
+	{
+		return -1;
+	}
 
 	const int nsortkeys = queue->nsortkeys;
 	SortSupport sortkeys = queue->sortkeys;
@@ -179,69 +190,6 @@ binaryheap_add_unordered_autoresize(binaryheap *heap, Datum d)
 }
 
 static void
-batch_queue_heap_push_new_segment_batch(BatchQueueHeap *queue)
-{
-	Assert(queue->nsegkeys > 0);
-	Assert(queue->new_segment_batch_index >= 0);
-	Assert(binaryheap_empty(queue->merge_heap));
-
-	for (int key = 0; key < queue->nsegkeys; key++)
-	{
-		queue->current_segmentby_entry[key].value = queue->new_segmentby_entry[key].value;
-		queue->current_segmentby_entry[key].null = queue->new_segmentby_entry[key].null;
-	}
-	int new_batch_index = queue->new_segment_batch_index;
-	queue->new_segment_batch_index = -1;
-	BatchArray *batch_array = &queue->queue.batch_array;
-	DecompressBatchState *batch_state = batch_array_get_at(batch_array, new_batch_index);
-
-	/*
-	 * Update the heap entries for the first tuple of the last batch.
-	 */
-	for (int key = 0; key < queue->nsortkeys; key++)
-	{
-		SortSupport sortKey = &queue->sortkeys[key + queue->nsegkeys];
-		const AttrNumber attr = AttrNumberGetAttrOffset(sortKey->ssup_attno);
-		queue->last_batch_first_tuple_entry[key].value =
-			queue->last_batch_first_tuple_slot->tts_values[attr];
-		queue->last_batch_first_tuple_entry[key].null =
-			queue->last_batch_first_tuple_slot->tts_isnull[attr];
-	}
-
-	TupleTableSlot *current_tuple = compressed_batch_current_tuple(batch_state);
-	if (TupIsNull(current_tuple))
-	{
-		/* Might happen if there are no tuples in the batch that pass the quals. */
-		batch_array_clear_at(batch_array, new_batch_index);
-		
-		return;
-	}
-
-	/*
-	 * Update the heap entries for this batch with the first decompressed tuple
-	 * values.
-	 */
-	for (int key = 0; key < queue->nsortkeys; key++)
-	{
-		SortSupport sortKey = &queue->sortkeys[key + queue->nsegkeys];
-		const AttrNumber attr = AttrNumberGetAttrOffset(sortKey->ssup_attno);
-		/*
-		 * We're working with virtual tuple slots so no need for slot_getattr().
-		 */
-		Assert(TTS_IS_VIRTUAL(current_tuple));
-		queue->heap_entries[(new_batch_index * queue->nsortkeys) + key].value =
-			current_tuple->tts_values[attr];
-		queue->heap_entries[(new_batch_index * queue->nsortkeys) + key].null =
-			current_tuple->tts_isnull[attr];
-	}
-
-	/*
-	 * Put the batch on the heap.
-	 */
-	queue->merge_heap = binaryheap_add_unordered_autoresize(queue->merge_heap, new_batch_index);
-}
-
-static void
 batch_queue_heap_pop(BatchQueue *bq, DecompressContext *dcontext)
 {
 	BatchQueueHeap *queue = (BatchQueueHeap *) bq;
@@ -249,6 +197,7 @@ batch_queue_heap_pop(BatchQueue *bq, DecompressContext *dcontext)
 
 	if (binaryheap_empty(queue->merge_heap))
 	{
+		queue->new_segment_batch_index = -1;
 		/* Allow this function to be called on the initial empty heap. */
 		return;
 	}
@@ -264,6 +213,12 @@ batch_queue_heap_pop(BatchQueue *bq, DecompressContext *dcontext)
 		/* Batch is exhausted, recycle batch_state */
 		(void) binaryheap_remove_first(queue->merge_heap);
 		batch_array_clear_at(batch_array, top_batch_index);
+
+		/* the only batch left is the new segment batch: reset to current segment batch.*/
+		if (queue->new_segment_batch_index >= 0 && binaryheap_size(queue->merge_heap) <= 1)
+		{
+			queue->new_segment_batch_index = -1;
+		}
 	}
 	else
 	{
@@ -297,13 +252,6 @@ batch_queue_heap_needs_next_batch(BatchQueue *_queue)
 
 	if (binaryheap_empty(queue->merge_heap))
 	{
-		/* We exausted previous segment: get a batch from the new segment */
-		if (queue->new_segment_batch_index >= 0)
-		{
-			batch_queue_heap_push_new_segment_batch(queue);
-			/* no need to get new batch from the input */
-			return false;
-		}
 		return true;
 	}
 	if (queue->new_segment_batch_index >= 0)
@@ -316,7 +264,8 @@ batch_queue_heap_needs_next_batch(BatchQueue *_queue)
 		compare_entries(&queue->heap_entries[queue->nsortkeys * top_batch_index],
 						queue->last_batch_first_tuple_entry,
 						queue->sortkeys,
-						queue->nsortkeys, /* offset = */queue->nsegkeys);
+						queue->nsortkeys,
+						/* offset = */ queue->nsegkeys);
 
 	/*
 	 * The invariant we have to preserve is that either:
@@ -331,7 +280,6 @@ batch_queue_heap_needs_next_batch(BatchQueue *_queue)
 	 */
 	return comparison_result <= 0;
 }
-
 
 static void
 batch_queue_heap_push_batch(BatchQueue *_queue, DecompressContext *dcontext,
@@ -364,7 +312,7 @@ batch_queue_heap_push_batch(BatchQueue *_queue, DecompressContext *dcontext,
 	{
 		/* Batch is pushed into empty heap: save its segment */
 		if (binaryheap_empty(queue->merge_heap))
-		{			
+		{
 			for (int key = 0; key < queue->nsegkeys; key++)
 			{
 				SortSupport sortKey = &queue->sortkeys[key];
@@ -376,8 +324,8 @@ batch_queue_heap_push_batch(BatchQueue *_queue, DecompressContext *dcontext,
 			}
 		}
 		/* Already have current segment: compare it with the incoming batch segment */
-		else 
-		{			
+		else
+		{
 			for (int key = 0; key < queue->nsegkeys; key++)
 			{
 				SortSupport sortKey = &queue->sortkeys[key];
@@ -387,20 +335,21 @@ batch_queue_heap_push_batch(BatchQueue *_queue, DecompressContext *dcontext,
 				queue->new_segmentby_entry[key].null =
 					queue->last_batch_first_tuple_slot->tts_isnull[attr];
 			}
-			const int comparison_result =
-				compare_entries(queue->current_segmentby_entry,
-								queue->new_segmentby_entry,
-								queue->sortkeys,
-								queue->nsegkeys, /* offset = */0);
+			const int comparison_result = compare_entries(queue->current_segmentby_entry,
+														  queue->new_segmentby_entry,
+														  queue->sortkeys,
+														  queue->nsegkeys,
+														  /* offset = */ 0);
 			if (comparison_result != 0)
 			{
 				queue->new_segment_batch_index = new_batch_index;
+				for (int key = 0; key < queue->nsegkeys; key++)
+				{
+					queue->current_segmentby_entry[key].value =
+						queue->new_segmentby_entry[key].value;
+					queue->current_segmentby_entry[key].null = queue->new_segmentby_entry[key].null;
+				}
 			}
-		}
-		/* This batch changes current segment: deal with it later */
-		if (queue->new_segment_batch_index >= 0)
-		{
-			return;
 		}
 	}
 
@@ -422,6 +371,7 @@ batch_queue_heap_push_batch(BatchQueue *_queue, DecompressContext *dcontext,
 	{
 		/* Might happen if there are no tuples in the batch that pass the quals. */
 		batch_array_clear_at(batch_array, new_batch_index);
+		queue->new_segment_batch_index = -1;
 		return;
 	}
 
@@ -470,6 +420,7 @@ batch_queue_heap_top_tuple(BatchQueue *bq)
 static void
 batch_queue_heap_segmentby_cleanup(BatchQueueHeap *queue)
 {
+	queue->new_segment_batch_index = -1;
 	if (queue->current_segmentby_entry)
 	{
 		pfree(queue->current_segmentby_entry);
@@ -576,7 +527,8 @@ batch_queue_heap_create(int num_compressed_cols, const List *sortinfo,
 
 	queue->sortkeys = build_batch_sorted_merge_info(sortinfo, &queue->nsegkeys, &queue->nsortkeys);
 
-	queue->heap_entries = palloc(sizeof(HeapEntryColumn) * queue->nsortkeys * INITIAL_BATCH_CAPACITY);
+	queue->heap_entries =
+		palloc(sizeof(HeapEntryColumn) * queue->nsortkeys * INITIAL_BATCH_CAPACITY);
 
 	/*
 	 * Choose a specialization for faster comparison of the first column. This is
@@ -586,12 +538,12 @@ batch_queue_heap_create(int num_compressed_cols, const List *sortinfo,
 	 * case.
 	 */
 	binaryheap_comparator comparator = compare_heap_pos_generic;
-	if (queue->sortkeys[0].comparator == ssup_datum_int32_cmp)
+	if (queue->sortkeys[queue->nsegkeys].comparator == ssup_datum_int32_cmp)
 	{
 		comparator = compare_heap_pos_int32;
 	}
 #if SIZEOF_DATUM >= 8
-	else if (queue->sortkeys[0].comparator == ssup_datum_signed_cmp)
+	else if (queue->sortkeys[queue->nsegkeys].comparator == ssup_datum_signed_cmp)
 	{
 		comparator = compare_heap_pos_signed;
 	}
@@ -615,6 +567,6 @@ batch_queue_heap_create(int num_compressed_cols, const List *sortinfo,
 	queue->new_segment_batch_index = -1;
 
 	queue->queue.funcs = funcs;
-	
+
 	return &queue->queue;
 }

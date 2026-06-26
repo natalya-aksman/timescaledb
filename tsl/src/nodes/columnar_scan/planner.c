@@ -399,8 +399,8 @@ build_decompression_map(DecompressionMapContext *context, List *compressed_outpu
 			Oid typoid = get_atttype(info->chunk_rte->relid, uncompressed_chunk_attno);
 			bulk_decompression_possible =
 				!is_segment &&
-				tsl_get_decompress_all_function(compression_get_default_algorithm(typoid), typoid) !=
-				NULL;
+				tsl_get_decompress_all_function(compression_get_default_algorithm(typoid),
+												typoid) != NULL;
 		}
 		bulk_decompression_possible_for_some_columns |= bulk_decompression_possible;
 
@@ -1196,7 +1196,6 @@ columnar_scan_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 
 		int numkeys = list_length(dcpath->custom_path.path.pathkeys);
 		int numsegkeys = list_length(dcpath->required_compressed_pathkeys);
-		int numsortkeys = numkeys - numsegkeys;
 		List *sort_numsegkeys = list_make1_int(numsegkeys);
 
 		List *sort_col_idx = NIL;
@@ -1236,12 +1235,12 @@ columnar_scan_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 			{
 				em = lfirst(membercell);
 #endif
-					
+
 				if (em->em_is_const)
 				{
 					continue;
 				}
-					
+
 				int em_relid;
 				if (!bms_get_singleton_member(em->em_relids, &em_relid))
 				{
@@ -1261,7 +1260,7 @@ columnar_scan_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 				Var *var = find_var_subexpression(em->em_expr, em_relid);
 				Ensure(var != NULL,
 					   "non-Var pathkey not expected for compressed batch sorted merge");
-				
+
 				Assert((Index) var->varno == (Index) em_relid);
 
 				/*
@@ -1272,7 +1271,7 @@ columnar_scan_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 				const int decompressed_scan_attno =
 					context.uncompressed_attno_info[var->varattno].custom_scan_attno;
 				Assert(decompressed_scan_attno > 0);
-					
+
 				/*
 				 * Look up the correct sort operator from the PathKey's slightly
 				 * abstracted representation.
@@ -1295,24 +1294,16 @@ columnar_scan_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 				sort_collations = lappend_oid(sort_collations, var->varcollid);
 				sort_nulls = lappend_oid(sort_nulls, pk->pk_nulls_first);
 				sort_ops = lappend_oid(sort_ops, sortop);
-					
+
 				break;
 			}
 			Ensure(membercell != NULL,
 				   "could not find matching decompressed chunk column for batch sorted merge "
 				   "pathkey");
 		}
-		sort_options = list_make5(sort_col_idx, sort_ops, sort_collations, sort_nulls, sort_numsegkeys);
+		sort_options =
+			list_make5(sort_col_idx, sort_ops, sort_collations, sort_nulls, sort_numsegkeys);
 
-		/* For batch sorted merge we don't need to sort input
-		 * if pathkeys match all segmentby keys + orderby prefix,
-		 * and the only reason we need batch sorted merge is because of overlapping batches.
-		 */
-		if (numsegkeys + bms_num_members(dcpath->info->chunk_const_segmentby) == dcpath->info->num_segmentby_columns)
-		{
-			decompress_plan->custom_plans = custom_plans;
-		}
-		else
 		{
 			/*
 			 * Build a sort node for the compressed batches. The sort function is
@@ -1321,41 +1312,59 @@ columnar_scan_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 			 * verified that the pathkeys match the compression order_by, so this
 			 * mapping is possible.
 			 */
-			AttrNumber *sortColIdx = palloc(sizeof(AttrNumber) * numsortkeys);
-			Oid *sortOperators = palloc(sizeof(Oid) * numsortkeys);
-			Oid *collations = palloc(sizeof(Oid) * numsortkeys);
-			bool *nullsFirst = palloc(sizeof(bool) * numsortkeys);
-			for (int i = 0; i < numsortkeys; i++)
+			AttrNumber *sortColIdx = palloc(sizeof(AttrNumber) * numkeys);
+			Oid *sortOperators = palloc(sizeof(Oid) * numkeys);
+			Oid *collations = palloc(sizeof(Oid) * numkeys);
+			bool *nullsFirst = palloc(sizeof(bool) * numkeys);
+			for (int i = 0; i < numkeys; i++)
 			{
-				Oid sortop = list_nth_oid(sort_ops, i + numsegkeys);
-				
+				Oid sortop = list_nth_oid(sort_ops, i);
+
 				/* Find the operator in pg_amop --- failure shouldn't happen */
 				Oid opfamily, opcintype;
 				CompareType strategy;
-				if (!get_ordering_op_properties(list_nth_oid(sort_ops, i + numsegkeys),
+				if (!get_ordering_op_properties(list_nth_oid(sort_ops, i),
 												&opfamily,
 												&opcintype,
 												&strategy))
 				{
 					elog(ERROR, "operator %u is not a valid ordering operator", sortOperators[i]);
 				}
-				
+
 				/*
 				 * This way to determine the matching metadata column works, because
 				 * we have already verified that the pathkeys match the compression
 				 * orderby.
 				 */
-				Assert(strategy == BTLessStrategyNumber || strategy == BTGreaterStrategyNumber);
-				char *lower_name;
-				char *upper_name;
-				orderby_sparse_metadata_names(dcpath->info->settings, i + 1, &lower_name, &upper_name);
-				char *meta_col_name = strategy == BTLessStrategyNumber ? lower_name : upper_name;
-				
-				AttrNumber attr_position =
-					get_attnum(dcpath->info->compressed_rte->relid, meta_col_name);
-				if (attr_position == InvalidAttrNumber)
+				AttrNumber attr_position;
+				if (i >= numsegkeys)
 				{
-					elog(ERROR, "couldn't find metadata column \"%s\"", meta_col_name);
+					Assert(strategy == BTLessStrategyNumber || strategy == BTGreaterStrategyNumber);
+					char *lower_name;
+					char *upper_name;
+					orderby_sparse_metadata_names(dcpath->info->settings,
+												  (i - numsegkeys) + 1,
+												  &lower_name,
+												  &upper_name);
+					char *meta_col_name =
+						strategy == BTLessStrategyNumber ? lower_name : upper_name;
+
+					attr_position = get_attnum(dcpath->info->compressed_rte->relid, meta_col_name);
+					if (attr_position == InvalidAttrNumber)
+					{
+						elog(ERROR, "couldn't find metadata column \"%s\"", meta_col_name);
+					}
+				}
+				else
+				{
+					char *colname = get_attname(dcpath->info->chunk_rte->relid,
+												list_nth_oid(sort_col_idx, i),
+												/* missing_ok = */ false);
+					attr_position = get_attnum(dcpath->info->compressed_rte->relid, colname);
+					if (attr_position == InvalidAttrNumber)
+					{
+						elog(ERROR, "couldn't find segmentby column \"%s\"", colname);
+					}
 				}
 
 				/*
@@ -1372,22 +1381,22 @@ columnar_scan_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 					sortColIdx[i] =
 						find_attr_pos_in_tlist(compressed_scan->plan.targetlist, attr_position);
 				}
-				
+
 				sortOperators[i] = sortop;
-				collations[i] = list_nth_oid(sort_collations, i + numsegkeys);
-				nullsFirst[i] = list_nth_oid(sort_nulls, i + numsegkeys);
+				collations[i] = list_nth_oid(sort_collations, i);
+				nullsFirst[i] = list_nth_oid(sort_nulls, i);
 			}
-			
+
 			/* Now build the compressed batches sort node */
 			Sort *sort = ts_make_sort((Plan *) compressed_scan,
-									  numsortkeys,
+									  numkeys,
 									  sortColIdx,
 									  sortOperators,
 									  collations,
 									  nullsFirst);
-			
+
 			ts_label_sort_with_costsize(root, sort, /* limit_tuples = */ -1.0);
-			
+
 			decompress_plan->custom_plans = list_make1(sort);
 		}
 	}

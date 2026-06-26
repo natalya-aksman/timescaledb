@@ -1491,7 +1491,7 @@ build_on_single_compressed_path(PlannerInfo *root, const Chunk *chunk, RelOptInf
 				 * create_merge_append_plan
 				 */
 				Path sort_path; /* dummy for result of cost_sort */
-				
+
 				cost_sort(&sort_path,
 						  root,
 						  sort_info->required_compressed_pathkeys,
@@ -1504,7 +1504,7 @@ build_on_single_compressed_path(PlannerInfo *root, const Chunk *chunk, RelOptInf
 						  0.0,
 						  work_mem,
 						  -1);
-				
+
 				cost_columnar_scan(compression_info, path_copy, &sort_path);
 			}
 		}
@@ -2903,10 +2903,17 @@ match_pathkeys_to_compression_orderby(List *pathkeys, List *chunk_em_exprs,
 									  const CompressionInfo *compression_info,
 									  bool for_batch_sorted_merge, bool *out_reverse)
 {
+	/* If there are pathkeys before orderby pathkeys in Batch sorted merge,
+	 * they are segmentby pathkeys and we will need to match their sort/null direction same as for
+	 * orderby. Otherwise i.e. if it's not for Batch sorted merge we can ignore pathkeys before
+	 * orderby.*/
+	int start_index = (for_batch_sorted_merge ? 0 : starting_pathkey_offset);
+
 	int compressed_pk_index = 0;
-	for (int i = starting_pathkey_offset; i < list_length(pathkeys); i++)
+	for (int i = start_index; i < list_length(pathkeys); i++)
 	{
 		compressed_pk_index++;
+		int compressed_pk_orderby_index = compressed_pk_index - starting_pathkey_offset;
 		PathKey *pk = list_nth_node(PathKey, pathkeys, i);
 		Node *node = strip_implicit_coercions((Node *) list_nth(chunk_em_exprs, i));
 
@@ -2923,15 +2930,24 @@ match_pathkeys_to_compression_orderby(List *pathkeys, List *chunk_em_exprs,
 		}
 
 		char *column_name = get_attname(compression_info->chunk_rte->relid, var->varattno, false);
-		int orderby_index = ts_array_position(compression_info->settings->fd.orderby, column_name);
-
-		if (orderby_index != compressed_pk_index)
+		int orderby_index = 0;
+		if (i >= starting_pathkey_offset)
 		{
-			return false;
+			orderby_index = ts_array_position(compression_info->settings->fd.orderby, column_name);
+
+			if (orderby_index != compressed_pk_orderby_index)
+			{
+				return false;
+			}
+		}
+		else
+		{
+			Assert(for_batch_sorted_merge);
+			Assert(ts_array_position(compression_info->settings->fd.segmentby, column_name));
 		}
 
 		/* Special handling for Batch Sorted Merge with minmax-only index */
-		if (for_batch_sorted_merge &&
+		if (for_batch_sorted_merge && orderby_index &&
 			orderby_sparse_kind(compression_info->settings, orderby_index) !=
 				ORDERBY_SPARSE_FIRSTLAST)
 		{
@@ -2951,17 +2967,22 @@ match_pathkeys_to_compression_orderby(List *pathkeys, List *chunk_em_exprs,
 			 * will be sorted before  [(1,1) ..  (1,19)] with min(1),(1)
 			 * but it should be sorted after as (1,20) > (1,1): correct with firstlast index.
 			 */
-			if (compressed_pk_index > 1)
+			if (compressed_pk_orderby_index > 1)
 			{
 				return false;
 			}
 		}
-
+		/* Internal compressed index is always ordered on segmentby ASC, so below is always false
+		 * for segmentby_index */
 		bool orderby_desc =
-			ts_array_get_element_bool(compression_info->settings->fd.orderby_desc, orderby_index);
+			(orderby_index ? ts_array_get_element_bool(compression_info->settings->fd.orderby_desc,
+													   orderby_index) :
+							 false);
 		bool orderby_nullsfirst =
-			ts_array_get_element_bool(compression_info->settings->fd.orderby_nullsfirst,
-									  orderby_index);
+			(orderby_index ?
+				 ts_array_get_element_bool(compression_info->settings->fd.orderby_nullsfirst,
+										   orderby_index) :
+				 false);
 		/*
 		 * In PG18+: pk_cmptype is either COMPARE_LT (for ASC) or COMPARE_GT (for DESC)
 		 * For previous PG versions we have compatibility macros to make these new names available.
@@ -3179,7 +3200,8 @@ build_sortinfo(PlannerInfo *root, const Chunk *chunk, RelOptInfo *chunk_rel,
 			sort_info.use_batch_sorted_merge =
 				match_pathkeys_to_compression_orderby(pathkeys,
 													  chunk_em_exprs,
-													  /* starting_pathkey_offset = */ sort_info.num_segmentby_pathkeys,
+													  /* starting_pathkey_offset = */
+													  sort_info.num_segmentby_pathkeys,
 													  compression_info,
 													  /* for_batch_sorted_merge = */ true,
 													  &sort_info.reverse);
@@ -3209,7 +3231,8 @@ build_sortinfo(PlannerInfo *root, const Chunk *chunk, RelOptInfo *chunk_rel,
 		sort_info.use_batch_sorted_merge =
 			match_pathkeys_to_compression_orderby(pathkeys,
 												  chunk_em_exprs,
-												  /* starting_pathkey_offset = */ sort_info.num_segmentby_pathkeys,
+												  /* starting_pathkey_offset = */
+												  sort_info.num_segmentby_pathkeys,
 												  compression_info,
 												  /* for_batch_sorted_merge = */ true,
 												  &sort_info.reverse);
