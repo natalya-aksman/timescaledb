@@ -2921,6 +2921,12 @@ match_pathkeys_to_compression_orderby(List *pathkeys, List *chunk_em_exprs,
 		{
 			return false;
 		}
+		/* Pathkey collation different from underlying column collation may lead to different sort
+		 * order */
+		if (var->varcollid != pk->pk_eclass->ec_collation)
+		{
+			return false;
+		}
 
 		char *column_name = get_attname(compression_info->chunk_rte->relid, var->varattno, false);
 		int orderby_index = ts_array_position(compression_info->settings->fd.orderby, column_name);
@@ -3131,7 +3137,6 @@ build_sortinfo(PlannerInfo *root, const Chunk *chunk, RelOptInfo *chunk_rel,
 		for (i = 0; i < list_length(pathkeys); i++)
 		{
 			Assert(bms_num_members(segmentby_columns) <= compression_info->num_segmentby_columns);
-
 			Node *node = strip_implicit_coercions((Node *) list_nth(chunk_em_exprs, i));
 
 			if (node == NULL || !IsA(node, Var))
@@ -3144,7 +3149,6 @@ build_sortinfo(PlannerInfo *root, const Chunk *chunk, RelOptInfo *chunk_rel,
 			{
 				break;
 			}
-
 			column_name = get_attname(compression_info->chunk_rte->relid, var->varattno, false);
 			if (!ts_array_is_member(compression_info->settings->fd.segmentby, column_name))
 			{
