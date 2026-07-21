@@ -546,6 +546,10 @@ drop table t cascade;
 -- Tests for BatchSortedMerge over one-segment data
 --------------------------------------
 
+-- Should use compressed index as query sort keys match compressed sort by orderby metadata
+SET enable_seqscan=0;
+SET enable_bitmapscan=0;
+
 -- Should be optimized (all segmentby columns are pinned to a Const, orderby columns match)
 SET timescaledb.debug_require_batch_sorted_merge = 'force';
 :PREFIX
@@ -612,10 +616,107 @@ SELECT * FROM test_nosegby ORDER BY segby, time DESC NULLS LAST;
 :PREFIX
 SELECT * FROM test_nosegby ORDER BY segby DESC NULLS LAST;
 
+-- Test for correct results on table with overlapping batches
+CREATE TABLE t2(time int NOT NULL, dev int NOT NULL, v int);
+SELECT table_name FROM create_hypertable('t2', 'time', chunk_time_interval => 10000);
+ALTER TABLE t2 SET (timescaledb.compress, timescaledb.compress_orderby='time DESC', timescaledb.compress_segmentby='dev');
+
+INSERT INTO t2 (time, dev, v) values
+(1, 1, 20),
+(1, 2, 300),
+(2, 3, 3000),
+(3, 1, 40),
+(4, 1, 10),
+(4, 2, 100),
+(6, 3, 2000),
+(6, 1, 10),
+(6, 2, 300),
+(8, 1, 60),
+(8, 2, 100),
+(8, 3, 7000);
+
+INSERT INTO t2 (time, dev, v) values
+(3, 1, 20),
+(3, 2, 300),
+(3, 3, 3000),
+(5, 1, 40),
+(5, 2, 100),
+(5, 3, 1000),
+(6, 1, 2000),
+(6, 1, 10),
+(6, 1, 200),
+(7, 1, 60),
+(7, 2, 100),
+(7, 3, 7000);
+
+INSERT INTO t2 (time, dev, v) values
+(5, 1, 20),
+(5, 3, 3000),
+(5, 2, 300),
+(7, 2, 400),
+(8, 1, 10),
+(8, 2, 100),
+(8, 3, 2000),
+(10, 1, 10),
+(11, 1, 300),
+(14, 1, 60),
+(14, 2, 100),
+(14, 3, 7000);
+
+INSERT INTO t2 (time, dev, v) values
+(9, 1, 20),
+(9, 3, 300),
+(9, 2, 30),
+(9, 2, 40),
+(10, 1, 10),
+(10, 2, 100),
+(10, 3, 2000),
+(11, 1, 10),
+(12, 1, 300),
+(13, 1, 60),
+(13, 2, 100),
+(13, 3, 7000);
+
+SELECT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('t2') chunk;
+
+SET timescaledb.debug_require_batch_sorted_merge = 'force';
+
+:PREFIX
+SELECT dev, time FROM t2 WHERE dev = 1 ORDER BY time DESC;
+SELECT dev, time FROM t2 WHERE dev = 1 ORDER BY time DESC;
+
+-- Cannot use compressed sort if orderby direction does not match:
+-- we will need to sort on "last" metadata column instead of "first" in this case.
+:PREFIX
+SELECT dev, time FROM t2 WHERE dev = 1 ORDER BY time;
+SELECT dev, time FROM t2 WHERE dev = 1 ORDER BY time;
+
+-- Predicates on non-segmentby columns
+:PREFIX
+SELECT dev, time FROM t2 WHERE time > 8 AND dev=1 ORDER BY dev, time DESC;
+SELECT dev, time FROM t2 WHERE time > 8 AND dev=1 ORDER BY dev, time DESC;
+
+:PREFIX
+SELECT dev, time, v FROM t2 WHERE v = 20 AND dev=1 ORDER BY dev, time DESC;
+SELECT dev, time, v FROM t2 WHERE v = 20 AND dev=1 ORDER BY dev, time DESC;
+
+-- Rescan with lateral subquery
+:PREFIX
+SELECT dev, time
+FROM (VALUES (1), (2), (3)) a(dv),
+     LATERAL (SELECT dev, time FROM t2 WHERE dev = a.dv ORDER BY time DESC) b;
+SELECT dev, time
+FROM (VALUES (1), (2), (3)) a(dv),
+     LATERAL (SELECT dev, time FROM t2 WHERE dev = a.dv ORDER BY time DESC) b;
+
 drop table test1 cascade;
 drop table test2 cascade;
 drop table test_segby cascade;
 drop table test_nosegby cascade;
+drop table t2 cascade;
 
 RESET timescaledb.enable_direct_compress_insert;
 RESET timescaledb.debug_require_batch_sorted_merge;
+
+RESET enable_seqscan;
+RESET enable_bitmapscan;

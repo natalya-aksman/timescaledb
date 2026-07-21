@@ -1298,82 +1298,95 @@ columnar_scan_plan_create(PlannerInfo *root, RelOptInfo *rel, CustomPath *path,
 
 		sort_options = list_make4(sort_col_idx, sort_ops, sort_collations, sort_nulls);
 
-		/*
-		 * Build a sort node for the compressed batches. The sort function is
-		 * derived from the sort function of the pathkeys, except that it refers
-		 * to the min and max metadata columns of the batches. We have already
-		 * verified that the pathkeys match the compression order_by, so this
-		 * mapping is possible.
-		 */
-		AttrNumber *sortColIdx = palloc(sizeof(AttrNumber) * numsortkeys);
-		Oid *sortOperators = palloc(sizeof(Oid) * numsortkeys);
-		Oid *collations = palloc(sizeof(Oid) * numsortkeys);
-		bool *nullsFirst = palloc(sizeof(bool) * numsortkeys);
-		for (int i = 0; i < numsortkeys; i++)
+		/* We can utilize compressed sort for batch sorted merge over unordered chunks: do not need
+		 * to add extra Sort node */
+		if (dcpath->required_compressed_pathkeys &&
+			pathkeys_contained_in(dcpath->required_compressed_pathkeys, compressed_path->pathkeys))
 		{
-			Oid sortop = list_nth_oid(sort_ops, i);
-
-			/* Find the operator in pg_amop --- failure shouldn't happen */
-			Oid opfamily, opcintype;
-			CompareType strategy;
-			if (!get_ordering_op_properties(list_nth_oid(sort_ops, i),
-											&opfamily,
-											&opcintype,
-											&strategy))
-			{
-				elog(ERROR, "operator %u is not a valid ordering operator", sortOperators[i]);
-			}
-
-			/*
-			 * This way to determine the matching metadata column works, because
-			 * we have already verified that the pathkeys match the compression
-			 * orderby.
-			 */
-			Assert(strategy == BTLessStrategyNumber || strategy == BTGreaterStrategyNumber);
-			char *lower_name;
-			char *upper_name;
-			orderby_sparse_metadata_names(dcpath->info->settings, i + 1, &lower_name, &upper_name);
-			char *meta_col_name = strategy == BTLessStrategyNumber ? lower_name : upper_name;
-
-			AttrNumber attr_position =
-				get_attnum(dcpath->info->compressed_rte->relid, meta_col_name);
-
-			if (attr_position == InvalidAttrNumber)
-			{
-				elog(ERROR, "couldn't find metadata column \"%s\"", meta_col_name);
-			}
-
-			/*
-			 * If the compressed target list is not based on the layout of
-			 * the uncompressed chunk (see comment for physical_tlist above),
-			 * adjust the position of the attribute.
-			 */
-			if (target_list_compressed_is_physical)
-			{
-				sortColIdx[i] = attr_position;
-			}
-			else
-			{
-				sortColIdx[i] =
-					find_attr_pos_in_tlist(compressed_scan->plan.targetlist, attr_position);
-			}
-
-			sortOperators[i] = sortop;
-			collations[i] = list_nth_oid(sort_collations, i);
-			nullsFirst[i] = list_nth_oid(sort_nulls, i);
+			decompress_plan->custom_plans = custom_plans;
 		}
+		else
+		{
+			/*
+			 * Build a sort node for the compressed batches. The sort function is
+			 * derived from the sort function of the pathkeys, except that it refers
+			 * to the min and max metadata columns of the batches. We have already
+			 * verified that the pathkeys match the compression order_by, so this
+			 * mapping is possible.
+			 */
+			AttrNumber *sortColIdx = palloc(sizeof(AttrNumber) * numsortkeys);
+			Oid *sortOperators = palloc(sizeof(Oid) * numsortkeys);
+			Oid *collations = palloc(sizeof(Oid) * numsortkeys);
+			bool *nullsFirst = palloc(sizeof(bool) * numsortkeys);
+			for (int i = 0; i < numsortkeys; i++)
+			{
+				Oid sortop = list_nth_oid(sort_ops, i);
 
-		/* Now build the compressed batches sort node */
-		Sort *sort = ts_make_sort((Plan *) compressed_scan,
-								  numsortkeys,
-								  sortColIdx,
-								  sortOperators,
-								  collations,
-								  nullsFirst);
+				/* Find the operator in pg_amop --- failure shouldn't happen */
+				Oid opfamily, opcintype;
+				CompareType strategy;
+				if (!get_ordering_op_properties(list_nth_oid(sort_ops, i),
+												&opfamily,
+												&opcintype,
+												&strategy))
+				{
+					elog(ERROR, "operator %u is not a valid ordering operator", sortOperators[i]);
+				}
 
-		ts_label_sort_with_costsize(root, sort, /* limit_tuples = */ -1.0);
+				/*
+				 * This way to determine the matching metadata column works, because
+				 * we have already verified that the pathkeys match the compression
+				 * orderby.
+				 */
+				Assert(strategy == BTLessStrategyNumber || strategy == BTGreaterStrategyNumber);
+				char *lower_name;
+				char *upper_name;
+				orderby_sparse_metadata_names(dcpath->info->settings,
+											  i + 1,
+											  &lower_name,
+											  &upper_name);
+				char *meta_col_name = strategy == BTLessStrategyNumber ? lower_name : upper_name;
 
-		decompress_plan->custom_plans = list_make1(sort);
+				AttrNumber attr_position =
+					get_attnum(dcpath->info->compressed_rte->relid, meta_col_name);
+
+				if (attr_position == InvalidAttrNumber)
+				{
+					elog(ERROR, "couldn't find metadata column \"%s\"", meta_col_name);
+				}
+
+				/*
+				 * If the compressed target list is not based on the layout of
+				 * the uncompressed chunk (see comment for physical_tlist above),
+				 * adjust the position of the attribute.
+				 */
+				if (target_list_compressed_is_physical)
+				{
+					sortColIdx[i] = attr_position;
+				}
+				else
+				{
+					sortColIdx[i] =
+						find_attr_pos_in_tlist(compressed_scan->plan.targetlist, attr_position);
+				}
+
+				sortOperators[i] = sortop;
+				collations[i] = list_nth_oid(sort_collations, i);
+				nullsFirst[i] = list_nth_oid(sort_nulls, i);
+			}
+
+			/* Now build the compressed batches sort node */
+			Sort *sort = ts_make_sort((Plan *) compressed_scan,
+									  numsortkeys,
+									  sortColIdx,
+									  sortOperators,
+									  collations,
+									  nullsFirst);
+
+			ts_label_sort_with_costsize(root, sort, /* limit_tuples = */ -1.0);
+
+			decompress_plan->custom_plans = list_make1(sort);
+		}
 	}
 	else
 	{

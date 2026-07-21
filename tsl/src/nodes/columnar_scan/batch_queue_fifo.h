@@ -57,6 +57,12 @@ batch_queue_fifo_top_tuple(BatchQueue *bq)
 	return compressed_batch_current_tuple(batch_array_get_at(&bq->batch_array, 0));
 }
 
+static inline void
+batch_queue_fifo_is_done(BatchQueue *bq)
+{
+	/* no-op */
+}
+
 static const struct BatchQueueFunctions BatchQueueFunctionsFifo = {
 	.free = batch_queue_fifo_free,
 	.needs_next_batch = batch_queue_fifo_needs_next_batch,
@@ -64,6 +70,7 @@ static const struct BatchQueueFunctions BatchQueueFunctionsFifo = {
 	.push_batch = batch_queue_fifo_push_batch,
 	.reset = batch_queue_fifo_reset,
 	.top_tuple = batch_queue_fifo_top_tuple,
+	.is_done = batch_queue_fifo_is_done,
 };
 
 extern BatchQueue *batch_queue_fifo_create(int num_compressed_cols,

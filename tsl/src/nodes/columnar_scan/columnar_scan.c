@@ -978,27 +978,44 @@ cost_batch_sorted_merge(PlannerInfo *root, const CompressionInfo *compression_in
 {
 	Path sort_path; /* dummy for result of cost_sort */
 
-	/*
-	 * Don't disable the compressed batch sorted merge plan with the enable_sort
-	 * GUC. We have a separate GUC for it, and this way you can try to force the
-	 * batch sorted merge plan by disabling sort.
-	 */
-	const bool old_enable_sort = enable_sort;
-	enable_sort = true;
-	cost_sort(&sort_path,
-			  root,
-			  dcpath->required_compressed_pathkeys,
+	/* We are utilizing compressed sort for batch sorted merge: do not need extra sort */
+	if (dcpath->required_compressed_pathkeys)
+	{
+		sort_path.rows = compressed_path->rows;
+		sort_path.startup_cost = compressed_path->startup_cost;
+		sort_path.total_cost = compressed_path->total_cost;
 #if PG18_GE
-			  compressed_path->disabled_nodes,
+		/* PG18 changes the way we handle disabled nodes so we
+		 * need to take those into account as well.
+		 *
+		 * https://github.com/postgres/postgres/commit/e2225346
+		 */
+		sort_path.disabled_nodes = compressed_path->disabled_nodes;
 #endif
-			  compressed_path->total_cost,
-			  compressed_path->rows,
-			  compressed_path->pathtarget->width,
-			  0.0,
-			  work_mem,
-			  -1);
-	enable_sort = old_enable_sort;
-
+	}
+	else
+	{
+		/*
+		 * Don't disable the compressed batch sorted merge plan with the enable_sort
+		 * GUC. We have a separate GUC for it, and this way you can try to force the
+		 * batch sorted merge plan by disabling sort.
+		 */
+		const bool old_enable_sort = enable_sort;
+		enable_sort = true;
+		cost_sort(&sort_path,
+				  root,
+				  dcpath->required_compressed_pathkeys,
+#if PG18_GE
+				  compressed_path->disabled_nodes,
+#endif
+				  compressed_path->total_cost,
+				  compressed_path->rows,
+				  compressed_path->pathtarget->width,
+				  0.0,
+				  work_mem,
+				  -1);
+		enable_sort = old_enable_sort;
+	}
 	/*
 	 * In compressed batch sorted merge, for each distinct segmentby value we
 	 * have to keep the corresponding latest batch open. Estimate the number of
@@ -1477,8 +1494,6 @@ build_on_single_compressed_path(PlannerInfo *root, const Chunk *chunk, RelOptInf
 	 */
 	if (sort_info->use_batch_sorted_merge && ts_guc_enable_decompression_sorted_merge)
 	{
-		Assert(!sort_info->use_compressed_sort);
-
 		ColumnarScanPath *path_copy =
 			copy_columnar_scan_path((ColumnarScanPath *) chunk_path_no_sort);
 
@@ -1492,6 +1507,12 @@ build_on_single_compressed_path(PlannerInfo *root, const Chunk *chunk, RelOptInf
 		 * query here.
 		 */
 		path_copy->custom_path.path.pathkeys = sort_info->decompressed_sort_pathkeys;
+
+		/* Batch sorted merge over unordered chunk can utilize compressed sort, copy the relevant
+		 * fields */
+		path_copy->needs_sequence_num = sort_info->needs_sequence_num;
+		path_copy->required_compressed_pathkeys = sort_info->required_compressed_pathkeys;
+
 		cost_batch_sorted_merge(root, compression_info, path_copy, compressed_path);
 
 		if (ts_guc_debug_require_batch_sorted_merge == DRO_Force)
@@ -1517,7 +1538,7 @@ build_on_single_compressed_path(PlannerInfo *root, const Chunk *chunk, RelOptInf
 	 * will determine whether to put an actual sort between the decompression
 	 * node and the scan during plan creation.
 	 */
-	if (sort_info->use_compressed_sort)
+	if (sort_info->use_compressed_sort && !sort_info->use_batch_sorted_merge)
 	{
 		ColumnarScanPath *columnar_scan_with_compressed_sort = NULL;
 		Path dummy_sort_path; /* dummy for result of cost_sort */
@@ -3229,6 +3250,15 @@ build_sortinfo(PlannerInfo *root, const Chunk *chunk, RelOptInfo *chunk_rel,
 													  compression_info,
 													  /* for_batch_sorted_merge = */ true,
 													  &sort_info.reverse);
+
+			/* Pathkeys are matching leading orderby metadata column:
+			 * can use already sorted compressed data for batch sorted merge.
+			 */
+			if (sort_info.use_batch_sorted_merge && !sort_info.reverse)
+			{
+				sort_info.needs_sequence_num = true;
+				sort_info.use_compressed_sort = true;
+			}
 		}
 		return sort_info;
 	}

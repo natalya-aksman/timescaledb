@@ -46,6 +46,10 @@ typedef struct BatchQueueHeap
 	 */
 	TupleTableSlot *last_batch_first_tuple_slot;
 	HeapEntryColumn *last_batch_first_tuple_entry;
+
+	/* When we have no more compressed batches but may still have tuples on the heap,
+	   do not check if we need next batch when there are none. */
+	bool done_fetching_compressed_batches;
 } BatchQueueHeap;
 
 /*
@@ -199,6 +203,12 @@ batch_queue_heap_needs_next_batch(BatchQueue *_queue)
 {
 	BatchQueueHeap *queue = (BatchQueueHeap *) _queue;
 
+	/* We consumed all of the compressed batches, time to empty the heap */
+	if (queue->done_fetching_compressed_batches)
+	{
+		return false;
+	}
+
 	if (binaryheap_empty(queue->merge_heap))
 	{
 		return true;
@@ -319,6 +329,7 @@ batch_queue_heap_reset(BatchQueue *bq)
 {
 	BatchQueueHeap *bqh = (BatchQueueHeap *) bq;
 	binaryheap_reset(bqh->merge_heap);
+	bqh->done_fetching_compressed_batches = false;
 }
 
 /*
@@ -343,6 +354,13 @@ batch_queue_heap_free(BatchQueue *_queue)
 	pfree(queue);
 }
 
+static void
+batch_queue_heap_is_done(BatchQueue *bq)
+{
+	BatchQueueHeap *bqh = (BatchQueueHeap *) bq;
+	bqh->done_fetching_compressed_batches = true;
+}
+
 const struct BatchQueueFunctions BatchQueueFunctionsHeap = {
 	.free = batch_queue_heap_free,
 	.needs_next_batch = batch_queue_heap_needs_next_batch,
@@ -350,6 +368,7 @@ const struct BatchQueueFunctions BatchQueueFunctionsHeap = {
 	.push_batch = batch_queue_heap_push_batch,
 	.reset = batch_queue_heap_reset,
 	.top_tuple = batch_queue_heap_top_tuple,
+	.is_done = batch_queue_heap_is_done,
 };
 
 static SortSupport
@@ -411,6 +430,8 @@ batch_queue_heap_create(int num_compressed_cols, const List *sortinfo,
 	queue->last_batch_first_tuple_slot = MakeSingleTupleTableSlot(result_tupdesc, &TTSOpsVirtual);
 	queue->last_batch_first_tuple_entry = palloc(sizeof(HeapEntryColumn) * queue->nkeys);
 	queue->queue.funcs = funcs;
+
+	queue->done_fetching_compressed_batches = false;
 
 	return &queue->queue;
 }

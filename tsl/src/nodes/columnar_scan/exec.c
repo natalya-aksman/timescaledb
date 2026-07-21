@@ -457,6 +457,7 @@ columnar_scan_exec_impl(ColumnarScanState *chunk_state, const BatchQueueFunction
 		if (TupIsNull(subslot))
 		{
 			/* Won't have more compressed tuples. */
+			bqfuncs->is_done(bq);
 			break;
 		}
 

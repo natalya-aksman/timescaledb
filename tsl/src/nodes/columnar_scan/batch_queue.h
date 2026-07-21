@@ -24,6 +24,7 @@ typedef struct BatchQueueFunctions
 	void (*push_batch)(struct BatchQueue *, DecompressContext *, TupleTableSlot *);
 	void (*reset)(struct BatchQueue *);
 	TupleTableSlot *(*top_tuple)(struct BatchQueue *);
+	void (*is_done)(struct BatchQueue *);
 } BatchQueueFunctions;
 
 typedef struct BatchQueue
