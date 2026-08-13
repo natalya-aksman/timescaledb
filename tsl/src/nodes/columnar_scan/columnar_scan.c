@@ -296,9 +296,10 @@ build_compressed_scan_pathkeys(const SortInfo *sort_info, PlannerInfo *root, Lis
 			for (; lc != NULL; lc = lnext(chunk_pathkeys, lc))
 			{
 				pk = lfirst(lc);
-				EquivalenceMember *chunk_em = ts_find_em_for_rel(pk->pk_eclass, info->chunk_rel);
+				List *emembers = ts_find_em_for_rel(pk->pk_eclass, info->chunk_rel);
+				Assert(emembers);
+				EquivalenceMember *chunk_em = linitial(emembers);
 
-				Assert(chunk_em);
 				expr = chunk_em->em_expr;
 				/*
 				 * Use em_datatype from the original equivalence member as the

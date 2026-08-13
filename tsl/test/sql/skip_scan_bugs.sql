@@ -199,5 +199,17 @@ drop table t_10429 cascade;
 RESET datestyle;
 RESET timezone;
 
+-- Fix #10409: skip on the correct index column in case of equivalent distinct columns
+CREATE TABLE zone_reports (reported_zone int4, assigned_zone int4, sensor_group int4 NOT NULL);
+CREATE INDEX ON zone_reports (assigned_zone, sensor_group, reported_zone);
+INSERT INTO zone_reports SELECT v % 10, v % 10, v % 100 FROM generate_series(1, 1000000) AS v;
+ANALYZE zone_reports;
+
+SET timescaledb.debug_skip_scan_info  TO true;
+SELECT DISTINCT ON (reported_zone, sensor_group) * FROM zone_reports WHERE reported_zone = assigned_zone;
+RESET timescaledb.debug_skip_scan_info;
+
+drop table zone_reports;
+
 RESET enable_seqscan;
 RESET enable_bitmapscan;

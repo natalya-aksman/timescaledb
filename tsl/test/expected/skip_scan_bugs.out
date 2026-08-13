@@ -228,5 +228,118 @@ RESET timescaledb.debug_skip_scan_info;
 drop table t_10429 cascade;
 RESET datestyle;
 RESET timezone;
+-- Fix #10409: skip on the correct index column in case of equivalent distinct columns
+CREATE TABLE zone_reports (reported_zone int4, assigned_zone int4, sensor_group int4 NOT NULL);
+CREATE INDEX ON zone_reports (assigned_zone, sensor_group, reported_zone);
+INSERT INTO zone_reports SELECT v % 10, v % 10, v % 100 FROM generate_series(1, 1000000) AS v;
+ANALYZE zone_reports;
+SET timescaledb.debug_skip_scan_info  TO true;
+SELECT DISTINCT ON (reported_zone, sensor_group) * FROM zone_reports WHERE reported_zone = assigned_zone;
+INFO:  SkipScan used on zone_reports_assigned_zone_sensor_group_reported_zone_idx(assigned_zone NOT NULL, sensor_group NOT NULL)
+ reported_zone | assigned_zone | sensor_group 
+---------------+---------------+--------------
+             0 |             0 |            0
+             0 |             0 |           10
+             0 |             0 |           20
+             0 |             0 |           30
+             0 |             0 |           40
+             0 |             0 |           50
+             0 |             0 |           60
+             0 |             0 |           70
+             0 |             0 |           80
+             0 |             0 |           90
+             1 |             1 |            1
+             1 |             1 |           11
+             1 |             1 |           21
+             1 |             1 |           31
+             1 |             1 |           41
+             1 |             1 |           51
+             1 |             1 |           61
+             1 |             1 |           71
+             1 |             1 |           81
+             1 |             1 |           91
+             2 |             2 |            2
+             2 |             2 |           12
+             2 |             2 |           22
+             2 |             2 |           32
+             2 |             2 |           42
+             2 |             2 |           52
+             2 |             2 |           62
+             2 |             2 |           72
+             2 |             2 |           82
+             2 |             2 |           92
+             3 |             3 |            3
+             3 |             3 |           13
+             3 |             3 |           23
+             3 |             3 |           33
+             3 |             3 |           43
+             3 |             3 |           53
+             3 |             3 |           63
+             3 |             3 |           73
+             3 |             3 |           83
+             3 |             3 |           93
+             4 |             4 |            4
+             4 |             4 |           14
+             4 |             4 |           24
+             4 |             4 |           34
+             4 |             4 |           44
+             4 |             4 |           54
+             4 |             4 |           64
+             4 |             4 |           74
+             4 |             4 |           84
+             4 |             4 |           94
+             5 |             5 |            5
+             5 |             5 |           15
+             5 |             5 |           25
+             5 |             5 |           35
+             5 |             5 |           45
+             5 |             5 |           55
+             5 |             5 |           65
+             5 |             5 |           75
+             5 |             5 |           85
+             5 |             5 |           95
+             6 |             6 |            6
+             6 |             6 |           16
+             6 |             6 |           26
+             6 |             6 |           36
+             6 |             6 |           46
+             6 |             6 |           56
+             6 |             6 |           66
+             6 |             6 |           76
+             6 |             6 |           86
+             6 |             6 |           96
+             7 |             7 |            7
+             7 |             7 |           17
+             7 |             7 |           27
+             7 |             7 |           37
+             7 |             7 |           47
+             7 |             7 |           57
+             7 |             7 |           67
+             7 |             7 |           77
+             7 |             7 |           87
+             7 |             7 |           97
+             8 |             8 |            8
+             8 |             8 |           18
+             8 |             8 |           28
+             8 |             8 |           38
+             8 |             8 |           48
+             8 |             8 |           58
+             8 |             8 |           68
+             8 |             8 |           78
+             8 |             8 |           88
+             8 |             8 |           98
+             9 |             9 |            9
+             9 |             9 |           19
+             9 |             9 |           29
+             9 |             9 |           39
+             9 |             9 |           49
+             9 |             9 |           59
+             9 |             9 |           69
+             9 |             9 |           79
+             9 |             9 |           89
+             9 |             9 |           99
+
+RESET timescaledb.debug_skip_scan_info;
+drop table zone_reports;
 RESET enable_seqscan;
 RESET enable_bitmapscan;
