@@ -214,5 +214,45 @@ drop table test2 cascade;
 drop table test3 cascade;
 drop table test4 cascade;
 
+-- Fix issue #10400: correctly match NULL tuple to NULL boundary with NULLS FIRST
+CREATE TABLE t_10400 (
+    time timestamptz NOT NULL,
+    seg int NOT NULL,
+    rank int,          -- nullable orderby column
+    val int NOT NULL
+);
+SELECT create_hypertable('t_10400', 'time', chunk_time_interval => interval '1 year');
+
+ALTER TABLE t_10400 SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'seg',
+    timescaledb.compress_orderby = 'rank DESC NULLS FIRST, time'
+);
+
+-- Compressed batch (NULL, 5)
+INSERT INTO t_10400 VALUES
+    ('2024-01-01 01:00:00+00', 1, NULL, 10),
+    ('2024-01-01 02:00:00+00', 1, NULL, 20),
+    ('2024-01-01 03:00:00+00', 1, 5, 30),
+    ('2024-01-01 04:00:00+00', 1, 3, 40),
+    ('2024-01-01 05:00:00+00', 1, 1, 50);
+SELECT count(compress_chunk(c)) FROM show_chunks('t_10400') c;
+
+-- Delayed insert into the compressed chunk, then recompress -> second batch.
+INSERT INTO t_10400 VALUES
+    ('2024-01-01 01:30:00+00', 1, NULL, 15),
+    ('2024-01-01 03:30:00+00', 1, 4, 35),
+    ('2024-01-01 06:00:00+00', 1, NULL, 60),
+    ('2024-01-01 02:30:00+00', 1, 10, 25);
+SELECT count(compress_chunk(c)) FROM show_chunks('t_10400') c;
+
+-- Should correctly merge NULL tuples into the batch (NULL, 5) with NULLS FIRST
+SELECT rank, time, val
+FROM t_10400
+WHERE seg = 1
+ORDER BY rank DESC NULLS FIRST, time;
+
+drop table t_10400 cascade;
+
 RESET timescaledb.enable_direct_compress_insert;
 RESET timescaledb.batch_sorted_merge;

@@ -1941,16 +1941,38 @@ update_orderby_scankeys(Datum *values, bool *isnulls, int num_segmentby, int num
 	}
 }
 
+/* uncompressed tuple key is NULL:
+ * if NULLS FIRST, Tuple_match if compressed slot lower boundary is NULL,
+ * else Tuple_before as NULL tuple sorts before anything but NULL,
+ * if NULLS LAST, Tuple_match if compressed slot upper boundary is NULL,
+ * else Tuple_after as NULL tuple sorts after anything but NULL. */
 static enum Batch_match_result
-handle_null_scan(int key_flags, bool nulls_first, enum Batch_match_result result)
+handle_null_scankey(TupleTableSlot *compressed_slot, ScanKey orderby_scankeys, bool nulls_first)
 {
-	/* uncompressed tuple key is NULL */
-	if (key_flags & SK_ISNULL)
+	if (nulls_first)
 	{
-		return nulls_first ? Tuple_before : Tuple_after;
+		ScanKey lower_key = &orderby_scankeys[0];
+		if (slot_attisnull(compressed_slot, lower_key->sk_attno))
+		{
+			return Tuple_match;
+		}
+		else
+		{
+			return Tuple_before;
+		}
 	}
-
-	return result;
+	else
+	{
+		ScanKey upper_key = &orderby_scankeys[1];
+		if (slot_attisnull(compressed_slot, upper_key->sk_attno))
+		{
+			return Tuple_match;
+		}
+		else
+		{
+			return Tuple_after;
+		}
+	}
 }
 
 static enum Batch_match_result
@@ -1968,15 +1990,23 @@ match_tuple_batch(TupleTableSlot *compressed_slot, int num_orderby, ScanKey orde
 	if (num_orderby >= 1)
 	{
 		ScanKey key = &orderby_scankeys[0];
-		if (!slot_key_test(compressed_slot, key, nulls_first[0]))
+		/* uncompressed tuple key is NULL */
+		if (key->sk_flags & SK_ISNULL)
 		{
-			return handle_null_scan(key->sk_flags, nulls_first[0], Tuple_before);
+			return handle_null_scankey(compressed_slot, orderby_scankeys, nulls_first[0]);
 		}
 
-		key = &orderby_scankeys[1];
+		/* uncompressed tuple key is NOT NULL */
+		/* check if sorts before lower boundary */
 		if (!slot_key_test(compressed_slot, key, nulls_first[0]))
 		{
-			return handle_null_scan(key->sk_flags, nulls_first[0], Tuple_after);
+			return Tuple_before;
+		}
+		key = &orderby_scankeys[1];
+		/* check if sorts after upper boundary */
+		if (!slot_key_test(compressed_slot, key, nulls_first[0]))
+		{
+			return Tuple_after;
 		}
 	}
 	return Tuple_match;
