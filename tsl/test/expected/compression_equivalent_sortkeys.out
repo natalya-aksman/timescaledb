@@ -1,0 +1,212 @@
+-- This file and its contents are licensed under the Timescale License.
+-- Please see the included NOTICE for copyright information and
+-- LICENSE-TIMESCALE for a copy of the license.
+-- Test queries over compressed data with sort keys equivalent to other columns
+\set PREFIX 'EXPLAIN (buffers off, costs off, timing off, summary off)'
+-- Set up compressed hypertable with 3 segmentby and 3 orderby keys
+CREATE TABLE test1 (
+    s1 integer NOT NULL,
+    s2 integer NOT NULL,
+    s3 smallint NOT NULL,
+    o1 integer NOT NULL,
+    o2 integer NOT NULL,
+    o3 smallint NOT NULL,
+    v integer);
+SELECT FROM create_hypertable('test1', 'o1');
+--
+
+ALTER TABLE test1 SET (timescaledb.compress, timescaledb.compress_segmentby='s1, s2, s3', timescaledb.compress_orderby = 'o1, o2 DESC, o3');
+INSERT INTO test1  SELECT t1, t2, t3, t1, t4, t3 % 2, t3*10
+FROM generate_series(1, 2) t1, generate_series(1, 5) t2, generate_series(1, 10) t3, generate_series(1, 4) t4;
+SELECT count(compress_chunk(ch)) FROM show_chunks('test1') ch;
+ count 
+-------
+     1
+
+SET enable_seqscan = 0;
+SET enable_bitmapscan = 0;
+SET max_parallel_workers_per_gather = 0;
+-- Equivalent segmentby columns, use compressed sort
+set timescaledb.debug_require_batch_sorted_merge to 'forbid';
+:PREFIX SELECT * FROM test1 WHERE s1 = s3 ORDER BY s3, s2;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+         Filter: (s1 = s3)
+
+:PREFIX SELECT * FROM test1 WHERE s1 = s3 ORDER BY s1, s2, o1;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+         Filter: (s1 = s3)
+
+:PREFIX SELECT * FROM test1 WHERE s1 = s2 ORDER BY s2, s3;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+         Filter: (s1 = s2)
+
+:PREFIX SELECT * FROM test1 WHERE s1 = s2 AND s2 = s3 ORDER BY s3;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+         Filter: ((s1 = s2) AND (s2 = s3))
+
+-- Use batch sorted merge
+set timescaledb.debug_require_batch_sorted_merge to 'force';
+:PREFIX SELECT * FROM test1 WHERE s1 = s3 ORDER BY s3, o1;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   ->  Sort
+         Sort Key: _hyper_1_1_chunk_compressed.s1, _hyper_1_1_chunk_compressed._ts_meta_v2_first_o1
+         ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+               Filter: (s1 = s3)
+
+:PREFIX SELECT * FROM test1 WHERE s1 = s2 ORDER BY s2, o1;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   ->  Sort
+         Sort Key: _hyper_1_1_chunk_compressed.s1, _hyper_1_1_chunk_compressed._ts_meta_v2_first_o1
+         ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+               Filter: (s1 = s2)
+
+-- Equivalent segmentby and orderby columns, use compressed sort
+set timescaledb.debug_require_batch_sorted_merge to 'forbid';
+:PREFIX SELECT * FROM test1 WHERE s1 = o1 AND s2 = 1 AND s3 = 1 ORDER BY s1, o1;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   Filter: (s1 = o1)
+   ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+         Index Cond: ((s2 = 1) AND (s3 = 1))
+         Filter: ((_ts_meta_v2_first_o1 <= s1) AND (_ts_meta_v2_last_o1 >= s1))
+
+:PREFIX SELECT * FROM test1 WHERE s1 = o1 AND s2 = 1 AND s3 = 1 ORDER BY s1, o1 DESC, o2;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   Filter: (s1 = o1)
+   ->  Sort
+         Sort Key: _hyper_1_1_chunk_compressed.s1, _hyper_1_1_chunk_compressed._ts_meta_v2_first_o2, _hyper_1_1_chunk_compressed._ts_meta_v2_last_o2
+         ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+               Index Cond: ((s2 = 1) AND (s3 = 1))
+               Filter: ((_ts_meta_v2_first_o1 <= s1) AND (_ts_meta_v2_last_o1 >= s1))
+
+:PREFIX SELECT * FROM test1 WHERE s3 = o1 AND s2 = 1 AND s1 = s3 ORDER BY s1, s2, s3, o2;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   Filter: ((s3 = o1) AND (o1 = s1))
+   ->  Sort
+         Sort Key: _hyper_1_1_chunk_compressed.s1, _hyper_1_1_chunk_compressed._ts_meta_v2_first_o2, _hyper_1_1_chunk_compressed._ts_meta_v2_last_o2
+         ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+               Index Cond: (s2 = 1)
+               Filter: ((_ts_meta_v2_first_o1 <= s3) AND (_ts_meta_v2_last_o1 >= s3) AND (_ts_meta_v2_first_o1 <= s1) AND (_ts_meta_v2_last_o1 >= s1))
+
+:PREFIX SELECT * FROM test1 WHERE s1 = o1 AND s2 = s3 ORDER BY s1, s3, o2 DESC;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   Filter: (s1 = o1)
+   ->  Sort
+         Sort Key: _hyper_1_1_chunk_compressed.s1, _hyper_1_1_chunk_compressed.s2, _hyper_1_1_chunk_compressed._ts_meta_v2_first_o2 DESC, _hyper_1_1_chunk_compressed._ts_meta_v2_last_o2 DESC
+         ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+               Filter: ((_ts_meta_v2_first_o1 <= s1) AND (_ts_meta_v2_last_o1 >= s1) AND (s2 = s3))
+
+-- Use batch sorted merge
+set timescaledb.debug_require_batch_sorted_merge to 'force';
+:PREFIX SELECT * FROM test1 WHERE s1 = o1 ORDER BY s1, o2 DESC, o3;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   Filter: (s1 = o1)
+   ->  Sort
+         Sort Key: _hyper_1_1_chunk_compressed.s1, _hyper_1_1_chunk_compressed._ts_meta_v2_first_o2 DESC, _hyper_1_1_chunk_compressed._ts_meta_v2_first_o3
+         ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+               Filter: ((_ts_meta_v2_first_o1 <= s1) AND (_ts_meta_v2_last_o1 >= s1))
+
+:PREFIX SELECT * FROM test1 WHERE s3 = o1 AND s1 = s3 ORDER BY s3, o2, o3 DESC;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   Filter: ((s3 = o1) AND (o1 = s1))
+   ->  Sort
+         Sort Key: _hyper_1_1_chunk_compressed.s1, _hyper_1_1_chunk_compressed._ts_meta_v2_last_o2, _hyper_1_1_chunk_compressed._ts_meta_v2_last_o3 DESC
+         ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+               Filter: ((_ts_meta_v2_first_o1 <= s3) AND (_ts_meta_v2_last_o1 >= s3) AND (_ts_meta_v2_first_o1 <= s1) AND (_ts_meta_v2_last_o1 >= s1))
+
+-- Equivalent orderby columns, use compressed sort
+set timescaledb.debug_require_batch_sorted_merge to 'forbid';
+:PREFIX SELECT * FROM test1 WHERE o1 = o2 ORDER BY s1, s2, s3, o1, o3;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   Filter: (o1 = o2)
+   ->  Sort
+         Sort Key: _hyper_1_1_chunk_compressed.s1, _hyper_1_1_chunk_compressed.s2, _hyper_1_1_chunk_compressed.s3, _hyper_1_1_chunk_compressed._ts_meta_v2_first_o1, _hyper_1_1_chunk_compressed._ts_meta_v2_last_o1, _hyper_1_1_chunk_compressed._ts_meta_v2_first_o3, _hyper_1_1_chunk_compressed._ts_meta_v2_last_o3
+         ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+
+:PREFIX SELECT * FROM test1 WHERE o1 = o2 ORDER BY s1, s2, s3, o1, o2, o3;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   Filter: (o1 = o2)
+   ->  Sort
+         Sort Key: _hyper_1_1_chunk_compressed.s1, _hyper_1_1_chunk_compressed.s2, _hyper_1_1_chunk_compressed.s3, _hyper_1_1_chunk_compressed._ts_meta_v2_first_o1, _hyper_1_1_chunk_compressed._ts_meta_v2_last_o1, _hyper_1_1_chunk_compressed._ts_meta_v2_first_o3, _hyper_1_1_chunk_compressed._ts_meta_v2_last_o3
+         ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+
+:PREFIX SELECT * FROM test1 WHERE o1 = o3 ORDER BY s1, s2, s3, o1, o2 DESC, o3;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   Filter: (o1 = o3)
+   ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+
+:PREFIX SELECT * FROM test1 WHERE o1 = o3 AND o1 = o2 ORDER BY s1, s2, s3, o3 DESC;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   Filter: ((o1 = o3) AND (o3 = o2))
+   ->  Sort
+         Sort Key: _hyper_1_1_chunk_compressed.s1, _hyper_1_1_chunk_compressed.s2, _hyper_1_1_chunk_compressed.s3, _hyper_1_1_chunk_compressed._ts_meta_v2_first_o1 DESC, _hyper_1_1_chunk_compressed._ts_meta_v2_last_o1 DESC
+         ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+
+-- Use batch sorted merge over seqscan
+set timescaledb.debug_require_batch_sorted_merge to 'force';
+set enable_seqscan=1;
+:PREFIX SELECT * FROM test1 WHERE o1 = o2 ORDER BY o1, o3;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   Filter: (o1 = o2)
+   ->  Sort
+         Sort Key: _hyper_1_1_chunk_compressed._ts_meta_v2_first_o1, _hyper_1_1_chunk_compressed._ts_meta_v2_first_o3
+         ->  Seq Scan on _hyper_1_1_chunk_compressed
+
+:PREFIX SELECT * FROM test1 WHERE o1 = o3 ORDER BY o1, o2 DESC;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   Filter: (o1 = o3)
+   ->  Sort
+         Sort Key: _hyper_1_1_chunk_compressed._ts_meta_v2_first_o1, _hyper_1_1_chunk_compressed._ts_meta_v2_first_o2 DESC
+         ->  Seq Scan on _hyper_1_1_chunk_compressed
+
+set enable_seqscan=0;
+-- Equivalent to other columns: can use compressed sort
+set timescaledb.debug_require_batch_sorted_merge to 'forbid';
+:PREFIX SELECT * FROM test1 WHERE s1 = v ORDER BY s1, v;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   Filter: (s1 = v)
+   ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+
+:PREFIX SELECT * FROM test1 WHERE o1 = v AND s1 = 1 AND s2 = s3 ORDER BY s2, o1, v;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   Filter: (o1 = v)
+   ->  Index Scan using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+         Index Cond: (s1 = 1)
+         Filter: (s2 = s3)
+
+:PREFIX SELECT * FROM test1 WHERE o1 = v AND s1 = 1 AND s2 = s3 ORDER BY s2 DESC, o1 DESC, v DESC;
+--- QUERY PLAN ---
+ Custom Scan (ColumnarScan) on _hyper_1_1_chunk
+   Filter: (o1 = v)
+   ->  Index Scan Backward using _hyper_1_1_chunk_compressed_s1_s2_s3__ts_meta_v2_first_o1___idx on _hyper_1_1_chunk_compressed
+         Index Cond: (s1 = 1)
+         Filter: (s2 = s3)
+
+reset timescaledb.debug_require_batch_sorted_merge;
+drop table test1 cascade;
+RESET enable_seqscan;
+RESET enable_bitmapscan;
+RESET max_parallel_workers_per_gather;

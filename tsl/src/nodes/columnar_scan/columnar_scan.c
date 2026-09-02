@@ -63,6 +63,9 @@ typedef struct SortInfo
 	 * as segmentwise batch sorted merge has 1 pathkeys segment on a heap at a time */
 	Bitmapset *segmentby_pathkey_columns;
 
+	/* Pathkeys equivalence class members satisfying compressed orderby */
+	List *orderby_pathkey_ems;
+
 	List *decompressed_sort_pathkeys;
 	QualCost decompressed_sort_pathkeys_cost;
 } SortInfo;
@@ -289,19 +292,17 @@ build_compressed_scan_pathkeys(const SortInfo *sort_info, PlannerInfo *root, Lis
 	}
 	else if (sort_info->needs_orderby_metadata || sort_info->use_batch_sorted_merge)
 	{
-		/* If there are no segmentby pathkeys, start from the beginning of the list */
-		if (info->num_segmentby_columns == 0)
-		{
-			lc = list_head(chunk_pathkeys);
-		}
-		Assert(lc != NULL);
+		int num_segmentby_pathkeys = list_length(required_compressed_pathkeys);
+		Assert(sort_info->orderby_pathkey_ems &&
+			   list_length(sort_info->orderby_pathkey_ems) + num_segmentby_pathkeys ==
+				   list_length(chunk_pathkeys));
 		Expr *expr;
 		char *column_name;
-		for (; lc != NULL; lc = lnext(chunk_pathkeys, lc))
+		for (int i = 0; i < list_length(sort_info->orderby_pathkey_ems); i++)
 		{
-			pk = lfirst(lc);
-			EquivalenceMember *chunk_em = ts_find_em_for_rel(pk->pk_eclass, info->chunk_rel);
-
+			pk = (PathKey *) list_nth(chunk_pathkeys, i + num_segmentby_pathkeys);
+			EquivalenceMember *chunk_em =
+				(EquivalenceMember *) list_nth(sort_info->orderby_pathkey_ems, i);
 			Assert(chunk_em);
 			expr = chunk_em->em_expr;
 			/*
@@ -1037,7 +1038,7 @@ cost_batch_sorted_merge(PlannerInfo *root, const CompressionInfo *compression_in
 {
 	Path sort_path; /* dummy for result of cost_sort */
 
-	/* We are utilizing compressed sort for batch sorted merge: do not need extra sort */
+	/* We are utilizing compressed sort order for batch sorted merge: do not need extra sort */
 	if (dcpath->required_compressed_pathkeys &&
 		pathkeys_contained_in(dcpath->required_compressed_pathkeys, compressed_path->pathkeys))
 	{
@@ -2295,6 +2296,7 @@ add_segmentby_to_equivalence_class(PlannerInfo *root, EquivalenceClass *cur_ec,
 		(TimescaleDBPrivate *) info->compressed_rel->fdw_private;
 	Assert(compressed_fdw_private != NULL);
 
+	bool found = false;
 	EquivalenceMember *cur_em;
 #if PG18_GE
 	/* Use specialized iterator to include child ems.
@@ -2316,7 +2318,6 @@ add_segmentby_to_equivalence_class(PlannerInfo *root, EquivalenceClass *cur_ec,
 		Expr *child_expr;
 		Relids new_relids;
 		Var *var;
-		Assert(!bms_overlap(cur_em->em_relids, info->compressed_rel->relids));
 
 		/* only consider EquivalenceMembers that are Vars, possibly with RelabelType, of the
 		 * uncompressed chunk */
@@ -2422,10 +2423,10 @@ add_segmentby_to_equivalence_class(PlannerInfo *root, EquivalenceClass *cur_ec,
 			compressed_fdw_private->compressed_ec_em_pairs =
 				lappend(compressed_fdw_private->compressed_ec_em_pairs, list_make2(cur_ec, em));
 
-			return true;
+			found = true;
 		}
 	}
-	return false;
+	return found;
 }
 
 static void
@@ -2986,47 +2987,142 @@ is_var_notnull(const CompressionInfo *compression_info, Var *var)
 	return false;
 }
 
+static Var *
+extract_valid_column_from_em(EquivalenceMember *em)
+{
+	Node *node = strip_implicit_coercions((Node *) em->em_expr);
+	if (node == NULL || !IsA(node, Var))
+	{
+		return NULL;
+	}
+
+	Var *var = castNode(Var, node);
+
+	if (var->varattno <= 0)
+	{
+		return NULL;
+	}
+	return var;
+}
+
+static bool
+orderby_column_match(List *ems, AttrNumber orderby_attnum)
+{
+	ListCell *lc;
+	foreach (lc, ems)
+	{
+		EquivalenceMember *em = castNode(EquivalenceMember, lfirst(lc));
+		Var *var = extract_valid_column_from_em(em);
+		if (var && var->varattno == orderby_attnum)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
 /*
  * Returns whether the pathkeys starting at the given offset match the compression
  * orderby, and whether the order is reverse.
  */
 static bool
-match_pathkeys_to_compression_orderby(List *pathkeys, List *chunk_em_exprs,
-									  int starting_pathkey_offset,
-									  const CompressionInfo *compression_info,
-									  bool for_batch_sorted_merge, bool *out_reverse)
+match_pathkeys_to_compression_orderby(List *pathkeys, List *chunk_eclasses,
+									  List *chunk_eclasses_for_orderby, int starting_pathkey_offset,
+									  const CompressionInfo *compression_info, SortInfo *sort_info,
+									  bool for_batch_sorted_merge)
 {
-	int compressed_pk_index = 0;
-	for (int i = starting_pathkey_offset; i < list_length(pathkeys); i++)
+	List *chunk_em_orderby = NIL;
+	bool out_reverse = false;
+
+	int pathkey_idx = starting_pathkey_offset;
+	PathKey *pk;
+	List *ems;
+
+	ListCell *lc;
+	int orderby_index;
+	int orderby_pk_index = 0;
+
+	/* Try to match each orderby column to a previous or current pathkey equivalence class member */
+	ArrayIterator it = array_create_iterator(compression_info->settings->fd.orderby, 0, NULL);
+	Datum datum;
+	bool isnull;
+	while (array_iterate(it, &datum, &isnull))
 	{
-		compressed_pk_index++;
-		PathKey *pk = list_nth_node(PathKey, pathkeys, i);
-		Node *node = strip_implicit_coercions((Node *) list_nth(chunk_em_exprs, i));
+		Ensure(!isnull, "array element was NULL");
+		char *column_name = TextDatumGetCString(datum);
 
-		if (node == NULL || !IsA(node, Var))
+		/* advance to the next pathkey if it's there */
+		if (pathkey_idx >= list_length(pathkeys))
+		{
+			break;
+		}
+		pk = list_nth_node(PathKey, pathkeys, pathkey_idx);
+		ems = list_nth(chunk_eclasses, pathkey_idx);
+
+		AttrNumber orderby_attnum = get_attnum(compression_info->chunk_rte->relid, column_name);
+		orderby_index = ts_array_position(compression_info->settings->fd.orderby, column_name);
+
+		Var *var;
+		bool matched = false;
+		bool matched_before = false;
+		foreach (lc, ems)
+		{
+			EquivalenceMember *em = castNode(EquivalenceMember, lfirst(lc));
+			var = extract_valid_column_from_em(em);
+			if (!var)
+			{
+				continue;
+			}
+			/* Pathkey collation different from underlying column collation may lead to different
+			 * sort order */
+			if (var->varcollid != pk->pk_eclass->ec_collation)
+			{
+				continue;
+			}
+
+			/* Do we already have column equivalent to this column in the previous pathkey
+			 * equivalence classes?
+			 */
+			ListCell *lm;
+			foreach (lm, chunk_eclasses_for_orderby)
+			{
+				List *prev_ems = lfirst(lm);
+				if (orderby_column_match(prev_ems, orderby_attnum))
+				{
+					matched_before = true;
+					break;
+				}
+			}
+
+			if (!matched_before)
+			{
+				if (orderby_attnum != var->varattno)
+				{
+					continue;
+				}
+				/* Matched orderby column with a nonredundant pathkey */
+				chunk_em_orderby = lappend(chunk_em_orderby, em);
+				orderby_pk_index++;
+				pathkey_idx++;
+			}
+			matched = true;
+			break;
+		}
+
+		if (!matched)
 		{
 			return false;
 		}
-
-		Var *var = castNode(Var, node);
-
-		if (var->varattno <= 0)
+		/* move on to the next orderby column */
+		if (matched_before)
 		{
-			return false;
-		}
-		/* Pathkey collation different from underlying column collation may lead to different sort
-		 * order */
-		if (var->varcollid != pk->pk_eclass->ec_collation)
-		{
-			return false;
+			continue;
 		}
 
-		char *column_name = get_attname(compression_info->chunk_rte->relid, var->varattno, false);
-		int orderby_index = ts_array_position(compression_info->settings->fd.orderby, column_name);
-
-		if (orderby_index != compressed_pk_index)
+		/* If this pathkey has more equivalent columns, save it for the next orderby match */
+		if (list_length(ems) > 1)
 		{
-			return false;
+			chunk_eclasses_for_orderby = lappend(chunk_eclasses_for_orderby, ems);
 		}
 
 		/* Special handling for Batch Sorted Merge with minmax-only index */
@@ -3050,7 +3146,7 @@ match_pathkeys_to_compression_orderby(List *pathkeys, List *chunk_em_exprs,
 			 * will be sorted before  [(1,1) ..  (1,19)] with min(1),(1)
 			 * but it should be sorted after as (1,20) > (1,1): correct with firstlast index.
 			 */
-			if (compressed_pk_index > 1)
+			if (orderby_pk_index > 1)
 			{
 				return false;
 			}
@@ -3061,6 +3157,7 @@ match_pathkeys_to_compression_orderby(List *pathkeys, List *chunk_em_exprs,
 		bool orderby_nullsfirst =
 			ts_array_get_element_bool(compression_info->settings->fd.orderby_nullsfirst,
 									  orderby_index);
+
 		/*
 		 * In PG18+: pk_cmptype is either COMPARE_LT (for ASC) or COMPARE_GT (for DESC)
 		 * For previous PG versions we have compatibility macros to make these new names available.
@@ -3102,16 +3199,18 @@ match_pathkeys_to_compression_orderby(List *pathkeys, List *chunk_em_exprs,
 		 * first pathkey match determines if this is forward or backward scan
 		 * any further pathkey items need to have same direction
 		 */
-		if (compressed_pk_index == 1)
+		if (orderby_pk_index == 1)
 		{
-			*out_reverse = this_pathkey_reverse;
+			out_reverse = this_pathkey_reverse;
 		}
-		else if (this_pathkey_reverse != *out_reverse)
+		else if (this_pathkey_reverse != out_reverse)
 		{
 			return false;
 		}
 	}
 
+	sort_info->reverse = out_reverse;
+	sort_info->orderby_pathkey_ems = chunk_em_orderby;
 	return true;
 }
 
@@ -3153,15 +3252,15 @@ build_sortinfo(PlannerInfo *root, const Chunk *chunk, RelOptInfo *chunk_rel,
 	 * parallel to the pathkeys list, with NULL entries if we didn't find a
 	 * match.
 	 */
-	List *chunk_em_exprs = NIL;
+	List *chunk_eclasses = NIL;
 	foreach (lc, pathkeys)
 	{
 		PathKey *pk = lfirst(lc);
 		EquivalenceClass *ec = pk->pk_eclass;
-		Expr *em_expr = NULL;
+		List *ems = NULL;
 		if (!ec->ec_has_volatile)
 		{
-			em_expr = ts_find_em_expr_for_rel(pk->pk_eclass, compression_info->chunk_rel);
+			ems = ts_find_em_for_rel(pk->pk_eclass, compression_info->chunk_rel);
 
 			/*
 			 * We can't sort the ColumnarScan on a set-returning function. It is
@@ -3169,29 +3268,32 @@ build_sortinfo(PlannerInfo *root, const Chunk *chunk, RelOptInfo *chunk_rel,
 			 * match and let the sort happen there. The leading sort keys
 			 * collected before it are still usable to sort the ColumnarScan.
 			 */
-			if (em_expr && expression_returns_set((Node *) em_expr))
+			if (ems && expression_returns_set(
+						   (Node *) castNode(EquivalenceMember, linitial(ems))->em_expr))
 			{
-				em_expr = NULL;
+				ems = NULL;
 			}
 		}
-		chunk_em_exprs = lappend(chunk_em_exprs, em_expr);
+		chunk_eclasses = lappend(chunk_eclasses, ems);
 	}
-	Assert(list_length(chunk_em_exprs) == list_length(pathkeys));
+	Assert(list_length(chunk_eclasses) == list_length(pathkeys));
 
 	/* Find the pathkeys we can use for explicitly sorting after decompression. */
 	List *sort_pathkey_exprs = NIL;
 	List *sort_pathkeys = NIL;
-	for (int i = 0; i < list_length(chunk_em_exprs); i++)
+	for (int i = 0; i < list_length(chunk_eclasses); i++)
 	{
 		PathKey *pk = list_nth_node(PathKey, pathkeys, i);
-		Expr *chunk_em_expr = (Expr *) list_nth(chunk_em_exprs, i);
-		if (chunk_em_expr == NULL)
+		List *chunk_ems = (List *) list_nth(chunk_eclasses, i);
+		if (chunk_ems == NULL)
 		{
 			break;
 		}
 
 		sort_pathkeys = lappend(sort_pathkeys, pk);
-		sort_pathkey_exprs = lappend(sort_pathkey_exprs, chunk_em_expr);
+		/* Use the first equivalence member expression for cost estimate */
+		sort_pathkey_exprs =
+			lappend(sort_pathkey_exprs, castNode(EquivalenceMember, linitial(chunk_ems))->em_expr);
 	}
 
 	if (sort_pathkeys == NIL)
@@ -3210,6 +3312,9 @@ build_sortinfo(PlannerInfo *root, const Chunk *chunk, RelOptInfo *chunk_rel,
 	 * only relies that the batches themselves are sorted which is
 	 * always the case.
 	 */
+
+	/* Save pathkeys which have orderby equivalence class members to match to orderby */
+	List *chunk_eclasses_for_orderby = NIL;
 
 	/* all segmentby columns need to be prefix of pathkeys */
 	int i = 0;
@@ -3231,29 +3336,41 @@ build_sortinfo(PlannerInfo *root, const Chunk *chunk, RelOptInfo *chunk_rel,
 		{
 			Assert(bms_num_members(segmentby_columns) <= compression_info->num_segmentby_columns);
 
-			Node *node = strip_implicit_coercions((Node *) list_nth(chunk_em_exprs, i));
+			List *ems = list_nth(chunk_eclasses, i);
+			bool found = false;
+			bool has_orderby = false;
+			foreach (lc, ems)
+			{
+				EquivalenceMember *em = castNode(EquivalenceMember, lfirst(lc));
+				var = extract_valid_column_from_em(em);
+				if (!var)
+				{
+					continue;
+				}
 
-			if (node == NULL || !IsA(node, Var))
+				column_name = get_attname(compression_info->chunk_rte->relid, var->varattno, false);
+				if (ts_array_is_member(compression_info->settings->fd.orderby, column_name))
+				{
+					has_orderby = true;
+				}
+				if (!ts_array_is_member(compression_info->settings->fd.segmentby, column_name))
+				{
+					continue;
+				}
+				segmentby_columns = bms_add_member(segmentby_columns, var->varattno);
+				/* Record segmentby columns which appear in equivalence classes of pathkeys */
+				sort_info.segmentby_pathkey_columns =
+					bms_add_member(sort_info.segmentby_pathkey_columns, var->varattno);
+				found = true;
+			}
+			if (!found)
 			{
 				break;
 			}
-			var = castNode(Var, node);
-
-			if (var->varattno <= 0)
+			if (has_orderby)
 			{
-				break;
+				chunk_eclasses_for_orderby = lappend(chunk_eclasses_for_orderby, ems);
 			}
-
-			column_name = get_attname(compression_info->chunk_rte->relid, var->varattno, false);
-			if (!ts_array_is_member(compression_info->settings->fd.segmentby, column_name))
-			{
-				break;
-			}
-
-			segmentby_columns = bms_add_member(segmentby_columns, var->varattno);
-			/* Record segmentby columns which are pathkeys */
-			sort_info.segmentby_pathkey_columns =
-				bms_add_member(sort_info.segmentby_pathkey_columns, var->varattno);
 		}
 
 		/*
@@ -3278,11 +3395,12 @@ build_sortinfo(PlannerInfo *root, const Chunk *chunk, RelOptInfo *chunk_rel,
 			 */
 			sort_info.use_batch_sorted_merge =
 				match_pathkeys_to_compression_orderby(pathkeys,
-													  chunk_em_exprs,
+													  chunk_eclasses,
+													  chunk_eclasses_for_orderby,
 													  /* starting_pathkey_offset = */ i,
 													  compression_info,
-													  /* for_batch_sorted_merge = */ true,
-													  &sort_info.reverse);
+													  &sort_info,
+													  /* for_batch_sorted_merge = */ true);
 			return sort_info;
 		}
 	}
@@ -3304,11 +3422,12 @@ build_sortinfo(PlannerInfo *root, const Chunk *chunk, RelOptInfo *chunk_rel,
 		 */
 		sort_info.use_batch_sorted_merge =
 			match_pathkeys_to_compression_orderby(pathkeys,
-												  chunk_em_exprs,
+												  chunk_eclasses,
+												  chunk_eclasses_for_orderby,
 												  /* starting_pathkey_offset = */ i,
 												  compression_info,
-												  /* for_batch_sorted_merge = */ true,
-												  &sort_info.reverse);
+												  &sort_info,
+												  /* for_batch_sorted_merge = */ true);
 		return sort_info;
 	}
 
@@ -3324,11 +3443,12 @@ build_sortinfo(PlannerInfo *root, const Chunk *chunk, RelOptInfo *chunk_rel,
 	 */
 	sort_info.use_compressed_sort =
 		match_pathkeys_to_compression_orderby(pathkeys,
-											  chunk_em_exprs,
+											  chunk_eclasses,
+											  chunk_eclasses_for_orderby,
 											  i,
 											  compression_info,
-											  /* for_batch_sorted_merge = */ false,
-											  &sort_info.reverse);
+											  &sort_info,
+											  /* for_batch_sorted_merge = */ false);
 
 	return sort_info;
 }
