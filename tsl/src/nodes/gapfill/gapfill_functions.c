@@ -55,8 +55,25 @@ gapfill_timestamptz_timezone_time_bucket(PG_FUNCTION_ARGS)
 	{
 		PG_RETURN_NULL();
 	}
-	return DirectFunctionCall3(ts_timestamptz_timezone_bucket,
-							   PG_GETARG_DATUM(0),
-							   PG_GETARG_DATUM(1),
-							   PG_GETARG_DATUM(2));
+
+	Datum origin = (PG_NARGS() > 5 && !PG_ARGISNULL(5) ? PG_GETARG_DATUM(5) : Int64GetDatum(DEFAULT_ORIGIN));
+	bool have_offset = PG_NARGS() > 6 && !PG_ARGISNULL(6);
+
+	if (!have_offset)
+	{
+		return DirectFunctionCall4(ts_timestamptz_timezone_bucket,
+								   PG_GETARG_DATUM(0),
+								   PG_GETARG_DATUM(1),
+								   PG_GETARG_DATUM(2),
+								   origin);
+	}
+	else
+	{
+		return DirectFunctionCall5(ts_timestamptz_timezone_bucket,
+								   PG_GETARG_DATUM(0),
+								   PG_GETARG_DATUM(1),
+								   PG_GETARG_DATUM(2),
+								   origin,
+								   PG_GETARG_DATUM(6));
+	}
 }
