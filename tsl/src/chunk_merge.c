@@ -203,6 +203,9 @@ merge_chunks_finish(Oid new_relid, RelationMergeInfo *relinfos, int nrelids,
 	if (ts_chunk_is_compressed(result_minfo->chunk))
 	{
 		ts_chunk_set_partial(result_minfo->chunk);
+		/* We do not recompress batches when we merge chunks, therefore cannot assume the merged
+		 * result is ordered */
+		ts_chunk_set_unordered(result_minfo->chunk);
 	}
 
 	Assert(stats->relid == result_minfo->relid);

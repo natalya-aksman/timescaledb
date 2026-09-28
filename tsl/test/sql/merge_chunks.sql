@@ -716,3 +716,34 @@ COMMIT;
 SELECT * FROM merge_layout_dead ORDER BY time;
 
 DROP TABLE merge_layout_dead;
+
+-- Issue #10691: after merging compressed chunks the resulting chunk should be marked "unordered"
+-- as when compressed chunks are merged batches are not recompressed
+
+CREATE TABLE t_10691 (ts timestamptz NOT NULL, c1 int8 NOT NULL, c2 int8 NOT NULL);
+SELECT FROM create_hypertable('t_10691', 'ts', chunk_time_interval => interval '7 days');
+ALTER TABLE t_10691 SET (timescaledb.compress, timescaledb.compress_segmentby = '',
+                   timescaledb.compress_orderby = 'c1 DESC NULLS FIRST, ts ASC, c2 DESC');
+INSERT INTO t_10691 SELECT '2024-01-01'::timestamptz + i * interval '1 minute', (i * 7919) % 300, i
+              FROM generate_series(1, 2500) i;
+INSERT INTO t_10691 SELECT '2024-01-10'::timestamptz + i * interval '1 minute', (i * 104729) % 300, i
+              FROM generate_series(1, 2500) i;
+SET timescaledb.compression_batch_size_limit = 1000;
+SELECT count(compress_chunk(c)) FROM show_chunks('t_10691') c;
+
+-- 300
+SELECT count(DISTINCT c1) FROM t_10691;
+
+-- merge the two oldest chunks by range, whatever their names
+SELECT array_agg(format('%I.%I', chunk_schema, chunk_name)::regclass) as cs
+FROM (SELECT * FROM timescaledb_information.chunks WHERE hypertable_name = 't_10691' ORDER BY range_start LIMIT 2) c \gset
+
+CALL merge_chunks(:'cs');
+
+-- Should be 300
+SELECT count(DISTINCT c1) FROM t_10691;
+
+-- Merged chunk should be unordered
+SELECT _timescaledb_functions.chunk_status_text(chunk) FROM show_chunks('t_10691') chunk order by chunk;
+
+drop table t_10691 cascade;
