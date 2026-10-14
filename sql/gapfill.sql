@@ -23,41 +23,27 @@ CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width INTERVAL
 CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width INTERVAL, ts TIMESTAMPTZ, timezone TEXT, start TIMESTAMPTZ=NULL, finish TIMESTAMPTZ=NULL) RETURNS TIMESTAMPTZ
 	AS '@MODULE_PATHNAME@', 'ts_gapfill_timestamptz_timezone_bucket' LANGUAGE C VOLATILE PARALLEL SAFE;
 
--- Gapfill with offset
-CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width SMALLINT, ts SMALLINT, start SMALLINT, finish SMALLINT, "offset" SMALLINT) RETURNS SMALLINT
+-- Gapfill with offset and origin
+CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width SMALLINT, ts SMALLINT, "offset" SMALLINT, start SMALLINT, finish SMALLINT) RETURNS SMALLINT
 	AS '@MODULE_PATHNAME@', 'ts_gapfill_int16_bucket' LANGUAGE C VOLATILE PARALLEL SAFE;
 
-CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width INT, ts INT, start INT, finish INT, "offset" INT) RETURNS INT
+CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width INT, ts INT, "offset" INT, start INT, finish INT) RETURNS INT
 	AS '@MODULE_PATHNAME@', 'ts_gapfill_int32_bucket' LANGUAGE C VOLATILE PARALLEL SAFE;
 
-CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width BIGINT, ts BIGINT, start BIGINT, finish BIGINT, "offset" BIGINT) RETURNS BIGINT
+CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width BIGINT, ts BIGINT, "offset" BIGINT, start BIGINT, finish BIGINT) RETURNS BIGINT
 	AS '@MODULE_PATHNAME@', 'ts_gapfill_int64_bucket' LANGUAGE C VOLATILE PARALLEL SAFE;
 
-CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width INTERVAL, ts DATE, start DATE, finish DATE, "offset" INTERVAL) RETURNS DATE
-	AS '@MODULE_PATHNAME@', 'ts_gapfill_date_bucket' LANGUAGE C VOLATILE PARALLEL SAFE;
+CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width INTERVAL, ts DATE, "offset" INTERVAL, origin DATE, start DATE, finish DATE) RETURNS DATE
+	AS '@MODULE_PATHNAME@', 'ts_gapfill_date_bucket_offset' LANGUAGE C VOLATILE PARALLEL SAFE;
 
-CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width INTERVAL, ts TIMESTAMP, start TIMESTAMP, finish TIMESTAMP, "offset" INTERVAL) RETURNS TIMESTAMP
-	AS '@MODULE_PATHNAME@', 'ts_gapfill_timestamp_bucket' LANGUAGE C VOLATILE PARALLEL SAFE;
+CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width INTERVAL, ts TIMESTAMP, "offset" INTERVAL, origin TIMESTAMP, start TIMESTAMP, finish TIMESTAMP) RETURNS TIMESTAMP
+	AS '@MODULE_PATHNAME@', 'ts_gapfill_timestamp_bucket_offset' LANGUAGE C VOLATILE PARALLEL SAFE;
 
-CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width INTERVAL, ts TIMESTAMPTZ, start TIMESTAMPTZ, finish TIMESTAMPTZ, "offset" INTERVAL) RETURNS TIMESTAMPTZ
-	AS '@MODULE_PATHNAME@', 'ts_gapfill_timestamptz_bucket' LANGUAGE C VOLATILE PARALLEL SAFE;
+CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width INTERVAL, ts TIMESTAMPTZ, "offset" INTERVAL, origin TIMESTAMPTZ, start TIMESTAMPTZ, finish TIMESTAMPTZ) RETURNS TIMESTAMPTZ
+	AS '@MODULE_PATHNAME@', 'ts_gapfill_timestamptz_bucket_offset' LANGUAGE C VOLATILE PARALLEL SAFE;
 
-CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width INTERVAL, ts TIMESTAMPTZ, timezone TEXT, start TIMESTAMPTZ, finish TIMESTAMPTZ, "offset" INTERVAL) RETURNS TIMESTAMPTZ
-	AS '@MODULE_PATHNAME@', 'ts_gapfill_timestamptz_timezone_bucket' LANGUAGE C VOLATILE PARALLEL SAFE;
-
--- Gapfill with origin and offset
-
-CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width INTERVAL, ts DATE, start DATE, finish DATE, origin DATE, "offset" INTERVAL = NULL) RETURNS DATE
-	AS '@MODULE_PATHNAME@', 'ts_gapfill_date_bucket' LANGUAGE C VOLATILE PARALLEL SAFE;
-
-CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width INTERVAL, ts TIMESTAMP, start TIMESTAMP, finish TIMESTAMP, origin TIMESTAMP, "offset" INTERVAL = NULL) RETURNS TIMESTAMP
-	AS '@MODULE_PATHNAME@', 'ts_gapfill_timestamp_bucket' LANGUAGE C VOLATILE PARALLEL SAFE;
-
-CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width INTERVAL, ts TIMESTAMPTZ, start TIMESTAMPTZ, finish TIMESTAMPTZ,  origin TIMESTAMPTZ, "offset" INTERVAL = NULL) RETURNS TIMESTAMPTZ
-	AS '@MODULE_PATHNAME@', 'ts_gapfill_timestamptz_bucket' LANGUAGE C VOLATILE PARALLEL SAFE;
-
-CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width INTERVAL, ts TIMESTAMPTZ, timezone TEXT, start TIMESTAMPTZ, finish TIMESTAMPTZ, origin TIMESTAMPTZ, "offset" INTERVAL = NULL) RETURNS TIMESTAMPTZ
-	AS '@MODULE_PATHNAME@', 'ts_gapfill_timestamptz_timezone_bucket' LANGUAGE C VOLATILE PARALLEL SAFE;
+CREATE OR REPLACE FUNCTION @extschema@.time_bucket_gapfill(bucket_width INTERVAL, ts TIMESTAMPTZ, timezone TEXT, "offset" INTERVAL, origin TIMESTAMPTZ, start TIMESTAMPTZ, finish TIMESTAMPTZ) RETURNS TIMESTAMPTZ
+	AS '@MODULE_PATHNAME@', 'ts_gapfill_timestamptz_timezone_bucket_offset' LANGUAGE C VOLATILE PARALLEL SAFE;
 
 -- locf function
 CREATE OR REPLACE FUNCTION @extschema@.locf(value ANYELEMENT, prev ANYELEMENT=NULL, treat_null_as_missing BOOL=false) RETURNS ANYELEMENT
