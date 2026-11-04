@@ -314,3 +314,46 @@ DROP TABLE extracol_chunk cascade;
 DROP TABLE outofrange_chunk cascade;
 DROP TABLE chunkapi cascade;
 DROP TABLE devices cascade;
+
+-- Test that a user cannot create a table in a schema where the user has no create privilege
+-- by using create_chunk(..., chunk_table).
+CREATE USER unprivileged;
+
+CREATE SCHEMA unprivileged_schema;
+GRANT USAGE ON SCHEMA unprivileged_schema TO unprivileged;   -- USAGE only, NO create
+
+CREATE SCHEMA privileged_schema;
+
+GRANT ALL ON SCHEMA privileged_schema TO unprivileged;
+ALTER DEFAULT PRIVILEGES IN SCHEMA privileged_schema GRANT ALL ON TABLES TO unprivileged;
+
+\c :TEST_DBNAME unprivileged
+CREATE TABLE privileged_schema.ht(ts timestamptz NOT NULL, v int);
+SELECT create_hypertable('privileged_schema.ht','ts');
+CREATE TABLE privileged_schema.chunkt(ts timestamptz NOT NULL, v int);
+INSERT INTO privileged_schema.chunkt VALUES ('2018-01-01', 7);
+
+\set ON_ERROR_STOP 0
+-- Should not create a table in a schema with no privileges
+CREATE TABLE unprivileged_schema.control_check(x int);
+
+-- Should not create a table in a schema with no privileges via "create_chunk"
+SELECT schema_name, table_name, created
+FROM _timescaledb_functions.create_chunk(
+       'privileged_schema.ht',
+       '{"ts": [1514419200000000, 1515024000000000]}'::jsonb,
+       'unprivileged_schema','control_check','privileged_schema.chunkt');
+\set ON_ERROR_STOP 1
+
+drop table privileged_schema.ht cascade;
+drop table privileged_schema.chunkt cascade;
+
+\c :TEST_DBNAME :ROLE_SUPERUSER;
+
+REVOKE USAGE ON SCHEMA unprivileged_schema FROM unprivileged;
+ALTER DEFAULT PRIVILEGES IN SCHEMA privileged_schema REVOKE ALL ON TABLES FROM unprivileged;
+REVOKE ALL ON SCHEMA privileged_schema FROM unprivileged;
+DROP USER unprivileged;
+
+DROP SCHEMA unprivileged_schema CASCADE;
+DROP SCHEMA privileged_schema CASCADE;

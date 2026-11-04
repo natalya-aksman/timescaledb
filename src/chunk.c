@@ -4,6 +4,7 @@
  * LICENSE-APACHE for a copy of the license.
  */
 #include <postgres.h>
+#include "catalog/pg_namespace.h"
 #include <access/genam.h>
 #include <access/htup.h>
 #include <access/htup_details.h>
@@ -1487,6 +1488,16 @@ chunk_create_from_hypercube_and_table_after_lock(const Hypertable *ht, Hypercube
 		ObjectAddresses *objects;
 
 		CheckSetNamespace(current_chunk_schemaid, new_chunk_schemaid);
+		/* Check namespace permissions. */
+		if (object_aclcheck(NamespaceRelationId, new_chunk_schemaid, GetUserId(), ACL_CREATE) !=
+			ACLCHECK_OK)
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("permissions denied: cannot create chunks in schema \"%s\"",
+							schema_name)));
+		}
+
 		objects = new_object_addresses();
 		AlterTableNamespaceInternal(chunk_rel, current_chunk_schemaid, new_chunk_schemaid, objects);
 		free_object_addresses(objects);
