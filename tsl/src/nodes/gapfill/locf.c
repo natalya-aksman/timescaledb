@@ -75,7 +75,10 @@ gapfill_locf_calculate(GapFillLocfColumnState *locf, GapFillState *state, TupleT
 	/* only evaluate expr for first tuple */
 	if (locf->isnull && locf->lookup_last && time == state->gapfill_start)
 	{
-		locf->value = gapfill_exec_expr(state, ecxt_slot, locf->lookup_last, &locf->isnull);
+		locf->value =
+			datumCopy(gapfill_exec_expr(state, ecxt_slot, locf->lookup_last, &locf->isnull),
+					  locf->base.typbyval,
+					  locf->base.typlen);
 	}
 
 	*value = locf->value;
