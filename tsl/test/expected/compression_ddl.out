@@ -2846,3 +2846,42 @@ SELECT count(*) AS leftover_compressed_relations FROM pg_class
 
 DROP TABLE drop_many_compressed;
 DROP TABLE drop_many;
+-- When adding a column to a hypertable, check every chunk if it has the column
+-- instead of quitting after finding the first chunk with the column
+CREATE TABLE t_addcol(time timestamptz NOT NULL, device int, v float);
+SELECT table_name FROM create_hypertable('t_addcol', 'time', chunk_time_interval => interval '1 day');
+ table_name 
+------------
+ t_addcol
+
+ALTER TABLE t_addcol SET (timescaledb.compress, timescaledb.compress_orderby = 'time', timescaledb.compress_segmentby = 'device');
+INSERT INTO t_addcol VALUES ('2024-01-01 00:00:00+00', 1, 1), ('2024-01-02 00:00:00+00', 1, 1);
+-- table has 2 chunks
+SELECT show_chunks('t_addcol', older_than => '2024-01-02 00:00:00+00') AS "CHUNK1" \gset
+SELECT show_chunks('t_addcol', newer_than => '2024-01-02 00:00:00+00') AS "CHUNK2" \gset
+-- compress second chunk
+SELECT count(compress_chunk(:'CHUNK2'));
+ count 
+-------
+     1
+
+SELECT compress_relid::regclass AS "COMP2" FROM _timescaledb_catalog.compression_settings WHERE relid::regclass = :'CHUNK2'::regclass \gset
+-- Create 1st chunk with a source table, add "newcol" column to it and compress it
+CREATE TABLE prebuilt (LIKE :COMP2);
+ALTER TABLE prebuilt ADD COLUMN newcol _timescaledb_internal.compressed_data;
+SELECT _timescaledb_functions.create_compressed_chunk(:'CHUNK1', 'prebuilt', 0, 0, 0, 0, 0, 0, 0, 0);
+          create_compressed_chunk          
+-------------------------------------------
+ _timescaledb_internal._hyper_33_125_chunk
+
+-- Now add "newcol" column to the entire hypertable.
+-- Should skip 1st chunk as it already has "newcol" column, should add "newcol" to second chunk.
+ALTER TABLE t_addcol ADD COLUMN newcol int DEFAULT 42;
+SELECT count(*) AS newcol_in_chunk2_compressed FROM pg_attribute WHERE attrelid = :'COMP2'::regclass AND attname = 'newcol';
+ newcol_in_chunk2_compressed 
+-----------------------------
+                           1
+
+-- Should not crash as all chunks have correct columns
+CALL merge_chunks(:'CHUNK1', :'CHUNK2');
+drop table t_addcol cascade;
